@@ -27,17 +27,17 @@ fn cuda_option_enabled(value: Option<&str>) -> bool {
     })
 }
 
-const DEFAULT_LLAMA_CPP_REPOSITORY: &str = "https://github.com/pereirajair/llama.cpp.git";
+const DEFAULT_LLAMA_CPP_REPOSITORY: &str = "https://github.com/pieceofmindcloud/llama.cpp.git";
 const DEFAULT_LLAMA_CPP_REF: &str = "pom-tensor-parallel";
 
 fn missing_llama_source_error(source: &Path) -> String {
     format!(
         "fork do llama.cpp não está disponível em {}.\n\n\
          O build tentou preparar automaticamente a branch `pom-tensor-parallel` de\n\
-         https://github.com/pereirajair/llama.cpp.git, mas não encontrou um checkout\n\
+         https://github.com/pieceofmindcloud/llama.cpp.git, mas não encontrou um checkout\n\
          com `ggml`. Verifique a rede e o Git, ou prepare manualmente com:\n\
          rm -f {}\n\
-         git clone --depth 1 --branch pom-tensor-parallel https://github.com/pereirajair/llama.cpp.git {}\n\n\
+         git clone --depth 1 --branch pom-tensor-parallel https://github.com/pieceofmindcloud/llama.cpp.git {}\n\n\
          Se você já tem um checkout local, use `LLAMA_SOURCE=/caminho/para/llama.cpp`\n\
          ao executar o build. O diretório informado precisa conter `ggml`.\n\
          Consulte docs/subsystems/build-and-run.md, seção `Preparar um worktree local`.",
@@ -110,7 +110,7 @@ fn ensure_llama_source(manifest_dir: &Path) -> Result<PathBuf, String> {
             return Err(format!(
                 "o checkout de llama.cpp em {} está incompleto: falta o diretório `ggml`.\n\
                  Remova o checkout incompleto ou aponte `LLAMA_SOURCE` para um checkout\n\
-                 do fork `pereirajair/llama.cpp` que contenha `ggml`.",
+                 do fork `pieceofmindcloud/llama.cpp` que contenha `ggml`.",
                 source.display(),
             ));
         }

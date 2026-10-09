@@ -11,7 +11,7 @@ por segurança de VRAM; `POM_CUDA_GRAPHS=1` é uma opção de build para habilit
 repositório, e a pasta que ele aponta (`/llama.cpp/`) está no `.gitignore`. O
 `build.rs` detecta um symlink quebrado ou a representação textual que o Git
 usa no Windows e prepara automaticamente um clone raso da branch
-`pom-tensor-parallel` de `pereirajair/llama.cpp` antes de caminhar pelos
+`pom-tensor-parallel` de `pieceofmindcloud/llama.cpp` antes de caminhar pelos
 arquivos nativos. Em Windows, ele remove o symlink ou arquivo-placeholder e
 instala o clone como um diretório real em `vendor/llama-cpp-sys-2/llama.cpp`;
 isso evita que o `WalkDir` dependa de um reparse point criado pelo checkout.

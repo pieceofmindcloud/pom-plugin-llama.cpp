@@ -19,7 +19,7 @@ do POM carrega este crate e roda a inferência no mesmo processo e na mesma GPU
 O build nativo lê o fork do llama.cpp de um checkout na raiz deste repositório:
 
 ```sh
-ln -s /caminho/para/llama.cpp llama.cpp   # fork pereirajair, branch pom-tensor-parallel
+ln -s /caminho/para/llama.cpp llama.cpp   # fork pieceofmindcloud, branch pom-tensor-parallel
 ```
 
 `vendor/llama-cpp-sys-2/llama.cpp` aponta para `../../llama.cpp`. Também é

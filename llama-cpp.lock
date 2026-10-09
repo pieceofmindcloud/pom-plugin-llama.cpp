@@ -1,0 +1,5 @@
+# The llama.cpp fork this engine is built against: the repository and the exact
+# commit. Used by CI and by the POM's Docker build to fetch the same source.
+LLAMA_CPP_REPOSITORY=https://github.com/pieceofmindcloud/llama.cpp.git
+LLAMA_CPP_BRANCH=pom-tensor-parallel
+LLAMA_CPP_COMMIT=239fba37570b3f3af3fc1fe7c2c0b5f5a5fdabba
