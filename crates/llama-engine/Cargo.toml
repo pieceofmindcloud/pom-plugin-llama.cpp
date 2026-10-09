@@ -1,0 +1,39 @@
+[package]
+name = "llama-engine"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+# Todo o código que fala com `llama-cpp-sys-2` (FFI, MTP, executor MoE, tensor
+# parallelism, leitura de GGUF, monitor de sistema) vive aqui, isolado de
+# `crates/node` para que editar o backend/rede/roteamento não reconstrua este
+# lado. Ver `docs/subsystems/build-and-run.md`.
+
+[features]
+default = []
+cuda = ["llama-cpp-sys-2/cuda"]
+metal = ["llama-cpp-sys-2/metal"]
+vulkan = ["llama-cpp-sys-2/vulkan"]
+
+[dependencies]
+llama-cpp-sys-2 = { version = "0.1.154", default-features = false, features = ["common", "mtmd"] }
+half = "2"
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[build-dependencies]
+# Compila `src/llama_mtp_shim.cpp` (ponte para as entradas NextN/MTP) e, com
+# `--features cuda`, `src/moe/cuda_kernels.cu`. Não acrescenta requisito de
+# build: o `llama-cpp-sys-2` já exige um compilador C++.
+cc = "1"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

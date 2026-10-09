@@ -1,0 +1,3 @@
+/target/
+# Checkout do fork do llama.cpp (ou symlink para ele), lido pelo build nativo.
+/llama.cpp
