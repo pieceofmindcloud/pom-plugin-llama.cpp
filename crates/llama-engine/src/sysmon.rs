@@ -105,13 +105,31 @@ mod win {
 /// and `nvidia-smi` costs a process spawn.
 const CACHE_TTL: Duration = Duration::from_millis(1200);
 
+/// A host utility's command, with no console window on Windows.
+///
+/// `pom.exe` is a GUI-subsystem process, so Windows gives every console
+/// program it starts (`nvidia-smi.exe` on each sample) a window of its own
+/// unless the child is created with `CREATE_NO_WINDOW`: the operator saw
+/// terminals open over and over while the dashboard was polling.
+fn host_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Execute a short host utility without registering it with Tokio's SIGCHLD
 /// reaper. Tokio's process reaper installs a process-wide signal handler, and
 /// that handler can interrupt the blocking UDP receive used by the pkarr DHT.
 /// The caller remains asynchronous because the std process is isolated in a
 /// blocking worker.
 async fn command_output(program: &'static str, args: Vec<String>) -> Option<std::process::Output> {
-    tokio::task::spawn_blocking(move || std::process::Command::new(program).args(args).output())
+    tokio::task::spawn_blocking(move || host_command(program).args(args).output())
         .await
         .ok()?
         .ok()
@@ -791,7 +809,7 @@ async fn read_gpu(ram: &MemStat) -> (GpuKind, Option<String>, Vec<GpuStat>, Vec<
 /// snapshot que o llama.cpp recebeu. Em máquinas sem NVIDIA, ou quando o
 /// `nvidia-smi` não está disponível, devolve `None`.
 pub fn current_process_gpu_memory_mb() -> Option<f64> {
-    let output = std::process::Command::new("nvidia-smi")
+    let output = host_command("nvidia-smi")
         .args([
             "--query-compute-apps=pid,used_memory",
             "--format=csv,noheader,nounits",

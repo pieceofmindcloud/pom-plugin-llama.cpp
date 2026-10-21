@@ -236,7 +236,10 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
   macOS e equivalentes (`/boot/efi`, `/boot`, `/efi`) são retiradas de `disks`,
   enquanto volumes de dados permanecem. `disk` é o volume do projeto;
   `disks` é toda partição montada relevante. Detalhe por plataforma em
-  `docs/subsystems/operations.md` ("Monitor de carga").
+  `docs/subsystems/operations.md` ("Monitor de carga"). Todo utilitário
+  externo sai de `host_command`, que no Windows cria o processo com
+  `CREATE_NO_WINDOW`: o `pom.exe` é GUI e, sem a flag, cada `nvidia-smi` da
+  amostragem abria uma janela de console.
 - `lib.rs` - re-exporta `KvCacheType`, `DEFAULT_FIT_MEMORY_MARGIN_MB` e
   `llama_cpp_sys_2` (para `node` alcançar a FFI crua sem redeclarar a dep).
 
