@@ -936,7 +936,18 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_process(
     }
 
     try {
-        return common_speculative_process(spec->spec, *batch)
+        // The POM fork's common API now consumes common_batch after the
+        // upstream batch_ext migration. Convert the validated public batch;
+        // this hook only needs its token IDs, positions, sequence IDs and
+        // output flags, not the native batch allocation.
+        common_batch common;
+        for (int32_t i = 0; i < batch->n_tokens; ++i) {
+            const bool output = batch->logits
+                ? batch->logits[i] != 0
+                : i == batch->n_tokens - 1;
+            common.add(batch->token[i], batch->pos[i], LLAMA_RS_MTP_SEQ_ID, output);
+        }
+        return common_speculative_process(spec->spec, common)
             ? LLAMA_RS_STATUS_OK
             : LLAMA_RS_STATUS_EXCEPTION;
     } catch (...) {
