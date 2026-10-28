@@ -1436,12 +1436,16 @@ impl LlmEngine {
         unsafe { sys::llama_vocab_eos(self.loaded.vocab) }
     }
 
-    /// Returns true for the model EOS or for a complete turn terminator named
-    /// by the GGUF chat template. A Gemma4 turn is not necessarily the model
-    /// EOS, so checking only `eos_token()` lets the next turn leak into the
-    /// response.
+    /// Returns true for the model EOS, for any end-of-generation token of the
+    /// vocabulary, or for a complete turn terminator named by the GGUF chat
+    /// template. A Gemma4 turn is not necessarily the model EOS, so checking
+    /// only `eos_token()` lets the next turn leak into the response.
     pub fn is_generation_stop(&self, recent: &[i32], next: i32) -> bool {
         if next == self.eos_token() {
+            return true;
+        }
+        // Flint ends a turn with `<|user|>`: llama.cpp marks it EOG, not EOS.
+        if unsafe { sys::llama_vocab_is_eog(self.loaded.vocab, next) } {
             return true;
         }
         let Some(template) = self.chat_template() else {
