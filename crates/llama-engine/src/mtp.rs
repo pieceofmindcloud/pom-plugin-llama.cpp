@@ -116,7 +116,7 @@
 //! código por arquitetura no fork (`build_arch_graph`/`res->t_h_nextn`) - o
 //! rascunho não pode fornecer o que o alvo nunca calculou. `qwen35.cpp` já
 //! fazia isso; `qwen4exp.cpp` (Qwen3.8-Flash-Next) ganhou o mesmo em
-//! `pieceofmindcloud/llama.cpp` (`pom-tensor-parallel`), gated por
+//! `pieceofmindcloud/llama.cpp` (`pom`), gated por
 //! `cparams.embeddings_nextn && !cparams.embeddings_nextn_masked` para não
 //! regredir o corte antecipado de linhas que a arquitetura já fazia na
 //! última camada (`inp_out_ids`) - sem MTP pedido esse corte continua
@@ -927,7 +927,7 @@ mod tests {
     /// esta prova primeiro é o **pré-requisito arquitetural** que a integração
     /// nova introduziu: o alvo precisa exportar `h_nextn` do próprio grafo
     /// mesmo quando o rascunho é um arquivo à parte - `qwen4exp.cpp` ganhou
-    /// isso em `pieceofmindcloud/llama.cpp` (`pom-tensor-parallel`), mas um alvo de
+    /// isso em `pieceofmindcloud/llama.cpp` (`pom`), mas um alvo de
     /// outra arquitetura sem esse suporte ainda faz `engine.mtp_ready()`
     /// continuar falso mesmo com um rascunho válido (degrada com aviso, não
     /// aborta - ver o cabeçalho deste módulo). A asserção abaixo distingue os

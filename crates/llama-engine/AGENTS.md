@@ -69,7 +69,7 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
   os dois nunca coexistem. O rascunho externo depende do alvo exportar
   `h_nextn` do próprio grafo (código por arquitetura no fork,
   `res->t_h_nextn`); `qwen4exp.cpp` ganhou isso em `pieceofmindcloud/llama.cpp`
-  (`pom-tensor-parallel`), gated por
+  (`pom`), gated por
   `cparams.embeddings_nextn && !cparams.embeddings_nextn_masked` para não
   regredir o corte antecipado de linhas da última camada quando MTP não foi
   pedido. Não há checagem estática do lado Rust dessa capacidade - a lista
@@ -78,7 +78,7 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
   `observe` e desliga o MTP daquela sessão com aviso, sem abortar. Ver o
   cabeçalho de `mtp.rs` para a mecânica completa e a convenção de nome
   (`catalog::find_mtp_draft_sibling`, prefixo `mtp-`). Para `qwen4exp`, o
-  fork (`pieceofmindcloud/llama.cpp`, `pom-tensor-parallel`) porta o padrão de
+  fork (`pieceofmindcloud/llama.cpp`, `pom`) porta o padrão de
   `qwen35.cpp`/`deepseek4.cpp` em `qwen4exp.cpp`: `load_arch_tensors` detecta
   um rascunho nextn-only (`mtp_only`, mesma sondagem de `blk.0.*`) e libera o
   tronco e os tensores de nível de modelo (`hc_head_*`) como

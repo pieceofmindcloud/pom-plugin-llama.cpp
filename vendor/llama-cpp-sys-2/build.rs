@@ -28,16 +28,16 @@ fn cuda_option_enabled(value: Option<&str>) -> bool {
 }
 
 const DEFAULT_LLAMA_CPP_REPOSITORY: &str = "https://github.com/pieceofmindcloud/llama.cpp.git";
-const DEFAULT_LLAMA_CPP_REF: &str = "pom-tensor-parallel";
+const DEFAULT_LLAMA_CPP_REF: &str = "pom";
 
 fn missing_llama_source_error(source: &Path) -> String {
     format!(
         "fork do llama.cpp não está disponível em {}.\n\n\
-         O build tentou preparar automaticamente a branch `pom-tensor-parallel` de\n\
+         O build tentou preparar automaticamente a branch `pom` de\n\
          https://github.com/pieceofmindcloud/llama.cpp.git, mas não encontrou um checkout\n\
          com `ggml`. Verifique a rede e o Git, ou prepare manualmente com:\n\
          rm -f {}\n\
-         git clone --depth 1 --branch pom-tensor-parallel https://github.com/pieceofmindcloud/llama.cpp.git {}\n\n\
+         git clone --depth 1 --branch pom https://github.com/pieceofmindcloud/llama.cpp.git {}\n\n\
          Se você já tem um checkout local, use `LLAMA_SOURCE=/caminho/para/llama.cpp`\n\
          ao executar o build. O diretório informado precisa conter `ggml`.\n\
          Consulte docs/subsystems/build-and-run.md, seção `Preparar um worktree local`.",
@@ -1833,7 +1833,7 @@ mod tests {
         let error = missing_llama_source_error(Path::new("vendor/llama-cpp-sys-2/llama.cpp"));
 
         assert!(error.contains("fork do llama.cpp não está disponível"));
-        assert!(error.contains("git clone --depth 1 --branch pom-tensor-parallel"));
+        assert!(error.contains("git clone --depth 1 --branch pom"));
         assert!(error.contains("LLAMA_SOURCE=/caminho/para/llama.cpp"));
         assert!(error.contains("vendor/llama-cpp-sys-2/llama.cpp"));
     }

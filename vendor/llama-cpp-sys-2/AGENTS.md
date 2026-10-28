@@ -11,7 +11,7 @@ por segurança de VRAM; `POM_CUDA_GRAPHS=1` é uma opção de build para habilit
 repositório, e a pasta que ele aponta (`/llama.cpp/`) está no `.gitignore`. O
 `build.rs` detecta um symlink quebrado ou a representação textual que o Git
 usa no Windows e prepara automaticamente um clone raso da branch
-`pom-tensor-parallel` de `pieceofmindcloud/llama.cpp` antes de caminhar pelos
+`pom` de `pieceofmindcloud/llama.cpp` antes de caminhar pelos
 arquivos nativos. Em Windows, ele remove o symlink ou arquivo-placeholder e
 instala o clone como um diretório real em `vendor/llama-cpp-sys-2/llama.cpp`;
 isso evita que o `WalkDir` dependa de um reparse point criado pelo checkout.
@@ -32,7 +32,7 @@ precedência sobre o symlink vendorizado `llama.cpp`. Isso também permite que o
 Docker use a fonte da release mesmo se o named context local estiver vazio.
 `POM_LLAMA_CPP_REPOSITORY` e `POM_LLAMA_CPP_REF` permitem apontar o preparo
 automático para outro remoto ou branch durante testes e desenvolvimento; o
-padrão é o fork público e a branch `pom-tensor-parallel`.
+padrão é o fork público e a branch `pom`.
 
 Depois de escolher o checkout, o `build.rs` normaliza um `LLAMA_SOURCE` relativo
 para um caminho absoluto e publica o caminho em
@@ -140,7 +140,7 @@ de sondagem seca: calcula o KV determinístico a partir da metadata GGUF e
 deixa a construção do grafo para a tentativa real, que tem recuo recuperável
 para a RAM. O `common/fit.cpp` do checkout local captura `free` e `total` antes
 de criar seu contexto de medição genérico. Essa é uma divergência local do
-fork e precisa acompanhar a branch `pom-tensor-parallel` usada no build. A
+fork e precisa acompanhar a branch `pom` usada no build. A
 regressão da contabilidade sintética fica em `llama.cpp/tests/test-fit-memory.cpp`
 e no alvo CTest `test-fit-memory`.
 
