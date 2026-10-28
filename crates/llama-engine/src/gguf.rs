@@ -750,6 +750,12 @@ pub struct GgufLayout {
     /// (attention interleaved with Gated DeltaNet / Mamba) are not a stack of
     /// identical blocks, and that decides where a slice may start.
     pub layer_kinds: Vec<Vec<String>>,
+    /// Values of the metadata counted from the first layer
+    /// (`LayerCountSemantics::FromStart`, such as `leading_dense_block_count`).
+    /// llama.cpp decides a layer's kind by comparing its local index with that
+    /// count, and the splitter rebases it by `start_layer`, so a kind change
+    /// exactly at that index survives the renumbering and is not a cut limit.
+    pub start_relative_layer_counts: Vec<u32>,
     /// `<arch>.nextn_predict_layers` — how many trailing layers form the
     /// NextN/MTP (multi-token prediction) block. On Qwen3.5+ the predictor
     /// tensors live only in the very last layer; a slice that does not end on
@@ -788,11 +794,17 @@ impl GgufLayout {
     /// error, sometimes silently wrong answers.
     ///
     /// For [8 Mamba, 8 Attention, 8 Mamba, 8 Attention] this returns [8, 16, 24].
+    ///
+    /// A change at an index declared by a start-relative count (for example the
+    /// dense prefix of a MoE, `leading_dense_block_count = 2`) is not a
+    /// boundary: the splitter rebases that count, so every cut keeps each
+    /// layer on its kind.
     pub fn arch_boundaries(&self) -> Vec<u32> {
         let n = self.layer_kinds.len();
         (1..n)
             .filter(|&i| self.layer_kinds[i] != self.layer_kinds[i - 1])
             .map(|i| i as u32)
+            .filter(|i| !self.start_relative_layer_counts.contains(i))
             .collect()
     }
 
@@ -1302,11 +1314,13 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
         if matches!(
             layer_count_semantics(&key),
             Some(LayerCountSemantics::FromStart)
-        ) && scalar_u32.is_none()
-        {
-            bail!(
-                "metadata '{key}' conta camadas desde o início, mas não é um inteiro escalar não negativo que caiba em u32"
-            );
+        ) {
+            let Some(count) = scalar_u32 else {
+                bail!(
+                    "metadata '{key}' conta camadas desde o início, mas não é um inteiro escalar não negativo que caiba em u32"
+                );
+            };
+            layout.start_relative_layer_counts.push(count);
         }
         if is_nextn_predict_layers_key(&key) {
             layout.nextn_predict_layers = scalar_u32.unwrap_or(0);
@@ -1547,6 +1561,7 @@ mod tests {
             total_bytes: 480,
             source_file_bytes: 0,
             layer_kinds: vec![],
+            start_relative_layer_counts: vec![],
             nextn_predict_layers: 0,
             has_nextn_tensors: false,
             serialized: None,
@@ -1583,6 +1598,30 @@ mod tests {
         };
         assert_eq!(hybrid.valid_prefix_end_layers(), vec![1, 3, 5, 7]);
         assert_eq!(hybrid.prefix_cut_granularity(), Some(2));
+    }
+
+    #[test]
+    fn dense_prefix_declared_by_leading_dense_count_is_not_a_boundary() {
+        let dense = vec!["ffn_up.weight".to_string()];
+        let moe = vec!["ffn_up_exps.weight".to_string()];
+        let mut layer_kinds = vec![dense.clone(), dense];
+        layer_kinds.extend(std::iter::repeat_n(moe, 6));
+        let mut layout = GgufLayout {
+            layer_bytes: vec![100; 8],
+            layer_kinds,
+            ..Default::default()
+        };
+        assert_eq!(layout.valid_prefix_end_layers(), vec![1, 7]);
+
+        layout.start_relative_layer_counts = vec![2];
+        assert!(layout.arch_boundaries().is_empty());
+        assert_eq!(layout.valid_prefix_end_layers(), (0..8).collect::<Vec<_>>());
+        assert!(layout.is_valid_slice_start(1));
+        assert_eq!(layout.snap_end_layer(0, 4, 8), 4);
+
+        // A count that does not match the kind change explains nothing.
+        layout.start_relative_layer_counts = vec![3];
+        assert_eq!(layout.arch_boundaries(), vec![2]);
     }
 
     #[test]
