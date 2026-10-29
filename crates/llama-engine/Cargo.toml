@@ -13,6 +13,10 @@ build = "build.rs"
 [features]
 default = []
 cuda = ["llama-cpp-sys-2/cuda"]
+# CUDA without the driver's virtual memory management (ggml's legacy memory
+# pool): the executable then links no libcuda and starts on a machine without
+# the NVIDIA driver (CPU/Vulkan there; CUDA when the driver is present).
+cuda-no-vmm = ["cuda", "llama-cpp-sys-2/cuda-no-vmm"]
 metal = ["llama-cpp-sys-2/metal"]
 vulkan = ["llama-cpp-sys-2/vulkan"]
 
