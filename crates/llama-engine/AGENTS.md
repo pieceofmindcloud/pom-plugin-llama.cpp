@@ -219,7 +219,10 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
   `embedding_length` textual e `clip.vision.projection_dim` para associar
   projetores, além de modelos multipart. `read_layout` valida arrays por camada
   usando a tabela unificada de todas as partes físicas. Para `qwen4exp`, mede
-  `per_layer_token_embd.weight` apenas nas faixas que contêm uma camada PLE;
+  `per_layer_token_embd.weight` apenas nas faixas que contêm uma camada PLE
+  (o mesmo vale para `deepseek41`, cujos cortes válidos vêm de
+  `restricted_slice_starts`: fonte de KV e de índice, depois de toda camada
+  Engram e não depois da fonte de candidatos);
   os três arrays de estrutura (`layer_multipliers`, `head_offsets` e
   `head_vocab_sizes`) permanecem completos, enquanto `ple.layers` é filtrado
   e rebaseado pelo fatiador. `kv_budget.rs` - orçamento de bytes do cache KV

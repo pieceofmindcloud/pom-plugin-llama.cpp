@@ -46,15 +46,82 @@ fn scalar_size(t: u32) -> Option<u64> {
 /// copied intact; `ple.layers` is a selector list and is filtered/rebased by
 /// the splitter. Keeping it in this category also exempts it from the generic
 /// short-array refusal.
+///
+/// DeepSeek-V4.1 has the same shape and more of it: its Engram token map and
+/// hash tables can be longer than the block count, which the generic rule would
+/// cut by layer without any error, and its KV and index source lists name
+/// layers.
 pub fn is_structural_array(key: &str, architecture: &str) -> bool {
-    architecture == "qwen4exp"
-        && matches!(
+    match architecture {
+        "qwen4exp" => matches!(
             key,
             "qwen4exp.ple.layers"
                 | "qwen4exp.ple.layer_multipliers"
                 | "qwen4exp.ple.head_offsets"
                 | "qwen4exp.ple.head_vocab_sizes"
-        )
+        ),
+        "deepseek41" => matches!(
+            key,
+            "deepseek41.ple.layers"
+                | "deepseek41.ple.layer_multipliers"
+                | "deepseek41.ple.head_offsets"
+                | "deepseek41.ple.head_vocab_sizes"
+                | "deepseek41.engram.token_map"
+                | "deepseek41.attention.kv_source_layers"
+                | "deepseek41.attention.indexer.source_layers"
+        ),
+        _ => false,
+    }
+}
+
+/// Structural arrays whose values are absolute layer indexes: a slice keeps the
+/// ones in its range, renumbered to its own blocks.
+pub fn is_layer_selector_array(key: &str, architecture: &str) -> bool {
+    match architecture {
+        "qwen4exp" => key == "qwen4exp.ple.layers",
+        "deepseek41" => matches!(
+            key,
+            "deepseek41.ple.layers"
+                | "deepseek41.attention.kv_source_layers"
+                | "deepseek41.attention.indexer.source_layers"
+        ),
+        _ => false,
+    }
+}
+
+/// The DeepSeek-V4.1 scalar naming the layer that pins the candidate blocks.
+/// llama.cpp treats its absence as "no candidate selection", which is right for
+/// a slice that ends before that layer; inside the range it is renumbered.
+pub const DEEPSEEK41_CANDIDATE_SOURCE_KEY: &str =
+    "deepseek41.attention.indexer.candidate_source_layer";
+
+/// Where a DeepSeek-V4.1 slice can start. `deepseek41.cpp` resolves these
+/// dependencies inside one graph, so each one limits the cut:
+/// - a compressed layer reads the KV and the top-k of the latest source layer
+///   at or before it, so the slice has to start at a layer that is both;
+/// - Engram hashes token ids and only the first slice has them: on an embedding
+///   input the graph skips Engram without an error, so every Engram layer stays
+///   before the cut;
+/// - the layers after the candidate source consume its pin, so the cut cannot
+///   come after that source.
+fn deepseek41_slice_starts(
+    kv_sources: &[u32],
+    index_sources: &[u32],
+    engram_layers: &[u32],
+    candidate_source: Option<u32>,
+    total_layers: u32,
+) -> Vec<u32> {
+    let mut starts: Vec<u32> = kv_sources
+        .iter()
+        .copied()
+        .filter(|&layer| layer > 0 && layer < total_layers)
+        .filter(|layer| index_sources.contains(layer))
+        .filter(|&layer| engram_layers.iter().all(|&engram| engram < layer))
+        .filter(|&layer| candidate_source.map_or(true, |source| layer <= source))
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    starts
 }
 
 /// What we care about from a GGUF header.
@@ -768,6 +835,10 @@ pub struct GgufLayout {
     /// It is populated by `read_layout`; hand-built layouts in unit tests use
     /// the legacy payload-only fallback.
     pub serialized: Option<SerializedLayout>,
+    /// Slice starts an architecture allows no matter what the tensor suffixes
+    /// say. `None` leaves the decision to `layer_kinds`; an empty list means the
+    /// model has no valid cut and stays whole.
+    pub restricted_slice_starts: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -775,7 +846,10 @@ pub struct SerializedLayout {
     architecture: String,
     hidden_dim: u32,
     original_block_count: u32,
-    qwen4exp_ple_layers: Vec<u32>,
+    ple_layers: Vec<u32>,
+    /// Values of the `is_layer_selector_array` keys.
+    layer_selectors: HashMap<String, Vec<u32>>,
+    deepseek41_candidate_source: Option<u32>,
     kv: Vec<LayoutKv>,
     tensors: Vec<LayoutTensor>,
 }
@@ -800,6 +874,9 @@ impl GgufLayout {
     /// boundary: the splitter rebases that count, so every cut keeps each
     /// layer on its kind.
     pub fn arch_boundaries(&self) -> Vec<u32> {
+        if let Some(starts) = &self.restricted_slice_starts {
+            return starts.clone();
+        }
         let n = self.layer_kinds.len();
         (1..n)
             .filter(|&i| self.layer_kinds[i] != self.layer_kinds[i - 1])
@@ -820,7 +897,7 @@ impl GgufLayout {
             return Vec::new();
         }
         let boundaries = self.arch_boundaries();
-        let mut ends = if boundaries.is_empty() {
+        let mut ends = if boundaries.is_empty() && self.restricted_slice_starts.is_none() {
             (0..total).collect::<Vec<_>>()
         } else {
             boundaries
@@ -841,7 +918,12 @@ impl GgufLayout {
         if start >= self.layer_count() {
             return false;
         }
-        self.arch_boundaries().is_empty() || start == 0 || self.arch_boundaries().contains(&start)
+        if start == 0 {
+            return true;
+        }
+        let boundaries = self.arch_boundaries();
+        (boundaries.is_empty() && self.restricted_slice_starts.is_none())
+            || boundaries.contains(&start)
     }
 
     /// Uniform layer distance when the model's valid prefix cuts are evenly
@@ -866,6 +948,18 @@ impl GgufLayout {
             return end;
         }
         let boundaries = self.arch_boundaries();
+        if self.restricted_slice_starts.is_some() {
+            // There is no shorter valid slice to fall back on here: the walk
+            // back below keeps `end` when it finds nothing, which is a cut the
+            // model does not allow.
+            let next_start = end + 1;
+            return boundaries
+                .iter()
+                .rev()
+                .find(|&&boundary| boundary <= next_start && boundary > start)
+                .or_else(|| boundaries.iter().find(|&&boundary| boundary > start))
+                .map_or(total - 1, |&boundary| boundary - 1);
+        }
         if boundaries.is_empty() {
             return end;
         }
@@ -937,6 +1031,13 @@ impl GgufLayout {
             if start > end || end >= total_layers {
                 bail!("intervalo de camadas inválido L{start}-{end}");
             }
+            if self.restricted_slice_starts.is_some() && !self.is_valid_slice_start(start) {
+                bail!(
+                    "{} não pode começar um slice em L{start}: cortes válidos em {:?}",
+                    serialized.architecture,
+                    self.arch_boundaries()
+                );
+            }
             let is_last = end.checked_add(1) == Some(total_layers);
             validate_slice_tensors(&serialized.architecture, &tensor_names, is_last)?;
         }
@@ -965,6 +1066,7 @@ pub fn required_output_tensors(architecture: &str) -> &'static [&'static str] {
             "output_hc_base.weight",
             "output_hc_scale.weight",
         ],
+        "deepseek41" => &["token_embd.weight", "output_norm.weight", "output.weight"],
         _ => &[],
     }
 }
@@ -1083,7 +1185,7 @@ fn layout_wants_tensor(
     start: u32,
     end: u32,
     is_last: bool,
-    qwen4exp_ple_layers: &[u32],
+    ple_layers: &[u32],
 ) -> bool {
     if let Some(index) = layout_block_index(name) {
         return (start..=end).contains(&index);
@@ -1091,8 +1193,8 @@ fn layout_wants_tensor(
     match name {
         "token_embd.weight" => true,
         "per_layer_token_embd.weight"
-            if architecture == "qwen4exp"
-                && qwen4exp_ple_layers
+            if matches!(architecture, "qwen4exp" | "deepseek41")
+                && ple_layers
                     .iter()
                     .any(|&layer| (start..=end).contains(&layer)) =>
         {
@@ -1149,9 +1251,16 @@ impl SerializedLayout {
                 bytes += Self::encoded_u32_size(&entry.key);
                 continue;
             }
-            if self.architecture == "qwen4exp" && entry.key == "qwen4exp.ple.layers" {
-                let local_count = self
-                    .qwen4exp_ple_layers
+            if entry.key == DEEPSEEK41_CANDIDATE_SOURCE_KEY
+                && self.architecture == "deepseek41"
+                && self
+                    .deepseek41_candidate_source
+                    .is_some_and(|layer| !(start..=end).contains(&layer))
+            {
+                continue;
+            }
+            if let Some(selected) = self.layer_selectors.get(&entry.key) {
+                let local_count = selected
                     .iter()
                     .filter(|&&layer| (start..=end).contains(&layer))
                     .count();
@@ -1209,7 +1318,7 @@ impl SerializedLayout {
                 start,
                 end,
                 is_last,
-                &self.qwen4exp_ple_layers,
+                &self.ple_layers,
             ) {
                 continue;
             }
@@ -1269,7 +1378,8 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
     let mut architecture = "llama".to_string();
     let mut hidden_dim = 4096u32;
     let mut source_block_count = None;
-    let mut qwen4exp_ple_layers = Vec::new();
+    let mut layer_selectors: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut deepseek41_candidate_source = None;
     let mut kv = Vec::with_capacity(n_kv);
     for _ in 0..n_kv {
         let kv_start = r.position()?;
@@ -1287,11 +1397,13 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
             T_ARRAY => {
                 let element_type = r.u32()?;
                 let count = r.u64()?;
-                if key == "qwen4exp.ple.layers" {
+                // By the key's own namespace: GGUF does not promise that
+                // `general.architecture` comes before this array.
+                if is_layer_selector_array(&key, key.split('.').next().unwrap_or_default()) {
                     if count > 100_000 {
-                        bail!("implausible qwen4exp PLE layer array length {count}");
+                        bail!("implausible layer selector array '{key}' length {count}");
                     }
-                    qwen4exp_ple_layers = (0..count)
+                    let selected = (0..count)
                         .map(|_| {
                             r.value_as_u32(element_type)?.ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -1301,6 +1413,7 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
+                    layer_selectors.insert(key.clone(), selected);
                 } else {
                     r.skip_array_payload(element_type, count)?;
                 }
@@ -1309,7 +1422,12 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
                     count,
                 });
             }
-            _ => scalar_u32 = r.value_as_u32(vtype)?,
+            _ => {
+                scalar_u32 = r.value_as_u32(vtype)?;
+                if key == DEEPSEEK41_CANDIDATE_SOURCE_KEY {
+                    deepseek41_candidate_source = scalar_u32;
+                }
+            }
         }
         if matches!(
             layer_count_semantics(&key),
@@ -1402,22 +1520,40 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
             0
         }
     });
-    if architecture == "qwen4exp" {
-        if let Some(&layer) = qwen4exp_ple_layers
+    let ple_layers = layer_selectors
+        .get(&format!("{architecture}.ple.layers"))
+        .cloned()
+        .unwrap_or_default();
+    if matches!(architecture.as_str(), "qwen4exp" | "deepseek41") {
+        if let Some(&layer) = ple_layers
             .iter()
             .find(|&&layer| layer >= original_block_count)
         {
             bail!(
-                "qwen4exp.ple.layers contém a camada {layer}, mas a origem declara apenas {original_block_count} blocos"
+                "{architecture}.ple.layers contém a camada {layer}, mas a origem declara apenas {original_block_count} blocos"
             );
         }
-        if !qwen4exp_ple_layers.is_empty()
+        if !ple_layers.is_empty()
             && !layout_tensors
                 .iter()
                 .any(|tensor| tensor.name == "per_layer_token_embd.weight")
         {
-            bail!("a origem qwen4exp declara PLE, mas não contém per_layer_token_embd.weight");
+            bail!("a origem {architecture} declara PLE, mas não contém per_layer_token_embd.weight");
         }
+    }
+    if architecture == "deepseek41" {
+        let selected = |name: &str| {
+            layer_selectors
+                .get(&format!("deepseek41.attention.{name}"))
+                .map_or(&[][..], Vec::as_slice)
+        };
+        layout.restricted_slice_starts = Some(deepseek41_slice_starts(
+            selected("kv_source_layers"),
+            selected("indexer.source_layers"),
+            &ple_layers,
+            deepseek41_candidate_source,
+            original_block_count,
+        ));
     }
     let arch_prefix = format!("{architecture}.");
     for entry in &kv {
@@ -1449,7 +1585,9 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
         architecture,
         hidden_dim,
         original_block_count,
-        qwen4exp_ple_layers,
+        ple_layers,
+        layer_selectors,
+        deepseek41_candidate_source,
         kv,
         tensors: layout_tensors,
     });
@@ -1565,6 +1703,7 @@ mod tests {
             nextn_predict_layers: 0,
             has_nextn_tensors: false,
             serialized: None,
+            restricted_slice_starts: None,
         };
         // Middle slice: 2 layers + embedding.
         assert_eq!(layout.slice_bytes(0, 1, false), 250);
@@ -1951,6 +2090,122 @@ mod tests {
             Some(LayerCountSemantics::FromEnd)
         );
         assert_eq!(layer_count_semantics("epsilon.block_count"), None);
+    }
+
+    fn u32_array_kv(values: &[u32]) -> Vec<u8> {
+        let mut payload = T_UINT32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload
+    }
+
+    /// Eight blocks shaped like the real DeepSeek-V4.1: the short lists name
+    /// layers, the long Engram lists describe the table, not the blocks.
+    fn deepseek41_layout_path(ple: &[u32], candidate: u32) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pom-deepseek41-{}.gguf",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut names: Vec<String> = (0..8).map(|layer| format!("blk.{layer}.attn.weight")).collect();
+        for name in [
+            "per_layer_token_embd.weight",
+            "token_embd.weight",
+            "output_norm.weight",
+            "output.weight",
+        ] {
+            names.push(name.into());
+        }
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut bytes = gguf_with_tensors(
+            &[
+                ("general.architecture", T_STRING, b"deepseek41".to_vec()),
+                ("deepseek41.block_count", T_UINT32, 8u32.to_le_bytes().to_vec()),
+                ("deepseek41.attention.kv_source_layers", T_ARRAY, u32_array_kv(&[2, 4])),
+                ("deepseek41.attention.indexer.source_layers", T_ARRAY, u32_array_kv(&[2, 4, 6])),
+                (
+                    "deepseek41.attention.indexer.candidate_source_layer",
+                    T_UINT32,
+                    candidate.to_le_bytes().to_vec(),
+                ),
+                ("deepseek41.ple.layers", T_ARRAY, u32_array_kv(ple)),
+                ("deepseek41.ple.layer_multipliers", T_ARRAY, u32_array_kv(&[1, 2, 3, 4])),
+                ("deepseek41.ple.head_offsets", T_ARRAY, u32_array_kv(&[0; 12])),
+                ("deepseek41.ple.head_vocab_sizes", T_ARRAY, u32_array_kv(&[7; 12])),
+                ("deepseek41.engram.token_map", T_ARRAY, u32_array_kv(&[0; 16])),
+            ],
+            &names,
+        );
+        bytes.resize(((bytes.len() + 31) & !31) + 32, 0);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn deepseek41_only_cuts_where_every_cross_layer_source_stays_reachable() {
+        let path = deepseek41_layout_path(&[1, 3], 4);
+        let layout = read_layout(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(layout.arch_boundaries(), vec![4]);
+        assert_eq!(layout.valid_prefix_end_layers(), vec![3, 7]);
+        assert!(layout.is_valid_slice_start(4));
+        assert!(!layout.is_valid_slice_start(2), "layer 3 uses Engram and would lose its token ids");
+        assert_eq!(layout.snap_end_layer(0, 5, 8), 3);
+        assert_eq!(layout.snap_end_layer(0, 1, 8), 3, "a short prefix cannot stop before its cut");
+        assert!(layout.validate_slice_ranges(&[(0, 3), (4, 7)]).is_ok());
+        let error = layout.validate_slice_ranges(&[(0, 1), (2, 7)]).unwrap_err().to_string();
+        assert!(error.contains("L2"), "{error}");
+    }
+
+    #[test]
+    fn deepseek41_without_a_valid_cut_stays_whole() {
+        // Engram at layer 5 needs token ids, so the cut would have to come after
+        // it, but the candidate pin at layer 4 forbids cutting after layer 4.
+        let path = deepseek41_layout_path(&[1, 5], 4);
+        let layout = read_layout(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(layout.arch_boundaries().is_empty());
+        assert_eq!(layout.valid_prefix_end_layers(), vec![7]);
+        assert!(!layout.is_valid_slice_start(4));
+        assert!(layout.is_valid_slice_start(0));
+        assert_eq!(layout.snap_end_layer(0, 5, 8), 7);
+    }
+
+    #[test]
+    fn deepseek41_engram_table_only_counts_in_the_slice_with_engram_layers() {
+        let path = deepseek41_layout_path(&[1, 3], 4);
+        let layout = read_layout(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        let serialized = layout.serialized.as_ref().unwrap();
+
+        assert!(layout_wants_tensor(
+            "per_layer_token_embd.weight",
+            "deepseek41",
+            0,
+            3,
+            false,
+            &serialized.ple_layers,
+        ));
+        assert!(!layout_wants_tensor(
+            "per_layer_token_embd.weight",
+            "deepseek41",
+            4,
+            7,
+            true,
+            &serialized.ple_layers,
+        ));
+    }
+
+    #[test]
+    fn deepseek41_requires_its_real_output_tensors_in_every_slice() {
+        assert_eq!(
+            required_output_tensors("deepseek41"),
+            &["token_embd.weight", "output_norm.weight", "output.weight"]
+        );
+        assert!(is_required_non_final_tensor("deepseek41", "output.weight"));
     }
 
     #[test]
