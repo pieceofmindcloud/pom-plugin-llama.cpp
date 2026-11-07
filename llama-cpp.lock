@@ -1,5 +1,5 @@
 # The llama.cpp fork this engine is built against: the repository and the exact
 # commit. Used by CI and by the POM's Docker build to fetch the same source.
 LLAMA_CPP_REPOSITORY=https://github.com/pieceofmindcloud/llama.cpp.git
-LLAMA_CPP_BRANCH=pom
-LLAMA_CPP_COMMIT=f2ed3b23c9ac07133c80c2b3d921549ef7d8e170
+LLAMA_CPP_BRANCH=pom-external-data
+LLAMA_CPP_COMMIT=bd4b9586adfb98e2589e248cbb821157fd348b8e
