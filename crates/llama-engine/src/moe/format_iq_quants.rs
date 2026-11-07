@@ -384,11 +384,7 @@ impl IqQuantSource {
         if experts == 0 {
             return Err(Q4LoadError::InvalidTensor("contagem de experts zero"));
         }
-        let file = File::open(path.as_ref()).map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        // SAFETY: Mmap owns the mapping for the lifetime of IqQuantSource.
-        let mmap =
-            unsafe { Mmap::map(&file) }.map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        let (data_start, tensors) = parse_tensor_table(&mmap)?;
+        let (mmap, data_start, tensors) = super::format_q4_0::map_tensor_source(path.as_ref())?;
         let mut fused = Vec::new();
         let mut gate = Vec::new();
         let mut up = Vec::new();

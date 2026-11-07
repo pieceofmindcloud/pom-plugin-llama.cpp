@@ -555,12 +555,7 @@ impl Q4_0Source {
         if experts == 0 {
             return Err(Q4LoadError::InvalidTensor("contagem de experts zero"));
         }
-        let file = File::open(path.as_ref()).map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        // SAFETY: the file descriptor stays alive until the mmap is created and
-        // Mmap owns the mapping for the lifetime of Q4_0Source.
-        let mmap =
-            unsafe { Mmap::map(&file) }.map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        let (data_start, tensors) = parse_tensor_table(&mmap)?;
+        let (mmap, data_start, tensors) = map_tensor_source(path.as_ref())?;
         let mut fused = Vec::new();
         let mut gate = Vec::new();
         let mut up = Vec::new();
@@ -974,6 +969,126 @@ fn validate_tensor(
         ));
     }
     Ok(())
+}
+
+/// Maps the bytes behind a GGUF's tensors: the file itself, or, for a
+/// header-only virtual slice (`general.external_data.*`), the one source file
+/// its tensors point into. Returns the mapping, the data start and the tensor
+/// table, with offsets relative to that data start, so every reader keeps
+/// indexing `data_start + offset`. A tensor stored in the header itself (the
+/// identity norm of a non-final range, never an expert) gets an offset no read
+/// can reach.
+pub fn map_tensor_source(path: &Path) -> Result<(Mmap, usize, Vec<TensorSpec>), Q4LoadError> {
+    let file = File::open(path).map_err(|error| Q4LoadError::Io(error.to_string()))?;
+    // SAFETY: Mmap owns the mapping and outlives every returned tensor slice.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|error| Q4LoadError::Io(error.to_string()))?;
+    let (data_start, mut tensors) = parse_tensor_table(&mmap)?;
+    let Some(external) = read_external_data(&mmap)? else {
+        return Ok((mmap, data_start, tensors));
+    };
+    if external.files.len() != 1 {
+        return Err(Q4LoadError::InvalidGguf(
+            "external tensor data in more than one file: the MoE executor reads one file",
+        ));
+    }
+    if external.tensor_files.len() != tensors.len()
+        || external.tensor_offsets.len() != tensors.len()
+    {
+        return Err(Q4LoadError::InvalidGguf(
+            "external tensor data does not cover the tensor table",
+        ));
+    }
+    let source = Path::new(&external.files[0]);
+    let source = if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        path.parent().unwrap_or(Path::new(".")).join(source)
+    };
+    for ((tensor, &file), &offset) in tensors
+        .iter_mut()
+        .zip(&external.tensor_files)
+        .zip(&external.tensor_offsets)
+    {
+        tensor.offset = if file == 0 { offset } else { u64::MAX };
+    }
+    let file = File::open(&source)
+        .map_err(|error| Q4LoadError::Io(format!("{}: {error}", source.display())))?;
+    // SAFETY: as above, for the source file the header points into.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|error| Q4LoadError::Io(error.to_string()))?;
+    Ok((mmap, 0, tensors))
+}
+
+struct ExternalData {
+    files: Vec<String>,
+    tensor_files: Vec<i32>,
+    tensor_offsets: Vec<u64>,
+}
+
+/// The `general.external_data.*` keys of a GGUF header, when it has them.
+fn read_external_data(raw: &[u8]) -> Result<Option<ExternalData>, Q4LoadError> {
+    let mut cursor = 8usize;
+    let _tensor_count = read_u64(raw, &mut cursor)?;
+    let kv_count = read_u64(raw, &mut cursor)?;
+    let (mut files, mut tensor_files, mut tensor_offsets) = (None, None, None);
+    for _ in 0..kv_count {
+        let key = read_string(raw, &mut cursor)?;
+        let kind = read_u32(raw, &mut cursor)?;
+        let wanted = matches!(
+            key.as_str(),
+            "general.external_data.files"
+                | "general.external_data.tensor_files"
+                | "general.external_data.tensor_offsets"
+        );
+        if !wanted || kind != 9 {
+            skip_value(raw, &mut cursor, kind)?;
+            continue;
+        }
+        let element_kind = read_u32(raw, &mut cursor)?;
+        let count = usize::try_from(read_u64(raw, &mut cursor)?)
+            .map_err(|_| Q4LoadError::InvalidGguf("array too long"))?;
+        if count > raw.len() {
+            return Err(Q4LoadError::InvalidGguf("array exceeds the file"));
+        }
+        match (key.as_str(), element_kind) {
+            ("general.external_data.files", 8) => {
+                files = Some(
+                    (0..count)
+                        .map(|_| read_string(raw, &mut cursor))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            ("general.external_data.tensor_files", 5) => {
+                tensor_files = Some(
+                    (0..count)
+                        .map(|_| read_u32(raw, &mut cursor).map(|value| value as i32))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            ("general.external_data.tensor_offsets", 10) => {
+                tensor_offsets = Some(
+                    (0..count)
+                        .map(|_| read_u64(raw, &mut cursor))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            _ => {
+                return Err(Q4LoadError::InvalidGguf(
+                    "external tensor data has the wrong type",
+                ))
+            }
+        }
+    }
+    match (files, tensor_files, tensor_offsets) {
+        (None, None, None) => Ok(None),
+        (Some(files), Some(tensor_files), Some(tensor_offsets)) => Ok(Some(ExternalData {
+            files,
+            tensor_files,
+            tensor_offsets,
+        })),
+        _ => Err(Q4LoadError::InvalidGguf(
+            "external tensor data is incomplete",
+        )),
+    }
 }
 
 pub fn parse_tensor_table(raw: &[u8]) -> Result<(usize, Vec<TensorSpec>), Q4LoadError> {
@@ -1574,6 +1689,91 @@ pub mod tests {
         ));
         drop(source);
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// A header-only copy of `source`: its KV section and tensor table, plus
+    /// `general.external_data.*` pointing every tensor at its bytes in `source`.
+    fn write_external_data_header(source: &Path, header: &Path) {
+        let raw = std::fs::read(source).unwrap();
+        let (data_start, tensors) = parse_tensor_table(&raw).unwrap();
+        let mut cursor = 8usize;
+        let tensor_count = read_u64(&raw, &mut cursor).unwrap();
+        let kv_count = read_u64(&raw, &mut cursor).unwrap();
+        let kv_begin = cursor;
+        for _ in 0..kv_count {
+            read_string(&raw, &mut cursor).unwrap();
+            let kind = read_u32(&raw, &mut cursor).unwrap();
+            skip_value(&raw, &mut cursor, kind).unwrap();
+        }
+        let kv_end = cursor;
+        let mut table_end = kv_end;
+        for _ in 0..tensor_count {
+            read_string(&raw, &mut table_end).unwrap();
+            let rank = read_u32(&raw, &mut table_end).unwrap();
+            table_end += 8 * rank as usize + 4 + 8;
+        }
+        let key = |name: &str| {
+            let mut out = (name.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(name.as_bytes());
+            out
+        };
+        let mut extra = key("general.external_data.files");
+        extra.extend_from_slice(&9u32.to_le_bytes());
+        extra.extend_from_slice(&8u32.to_le_bytes());
+        extra.extend_from_slice(&1u64.to_le_bytes());
+        extra.extend_from_slice(&key(source.to_str().unwrap()));
+        extra.extend_from_slice(&key("general.external_data.tensor_files"));
+        extra.extend_from_slice(&9u32.to_le_bytes());
+        extra.extend_from_slice(&5u32.to_le_bytes());
+        extra.extend_from_slice(&tensor_count.to_le_bytes());
+        for _ in 0..tensor_count {
+            extra.extend_from_slice(&0i32.to_le_bytes());
+        }
+        extra.extend_from_slice(&key("general.external_data.tensor_offsets"));
+        extra.extend_from_slice(&9u32.to_le_bytes());
+        extra.extend_from_slice(&10u32.to_le_bytes());
+        extra.extend_from_slice(&tensor_count.to_le_bytes());
+        for tensor in &tensors {
+            extra.extend_from_slice(&(data_start as u64 + tensor.offset).to_le_bytes());
+        }
+        let mut out = raw[..8].to_vec();
+        out.extend_from_slice(&tensor_count.to_le_bytes());
+        out.extend_from_slice(&(kv_count + 3).to_le_bytes());
+        out.extend_from_slice(&raw[kv_begin..kv_end]);
+        out.extend_from_slice(&extra);
+        out.extend_from_slice(&raw[kv_end..table_end]);
+        out.resize(out.len().div_ceil(32) * 32, 0);
+        std::fs::write(header, out).unwrap();
+    }
+
+    #[test]
+    fn a_header_with_external_data_reads_the_experts_from_the_source_file() {
+        let base = std::env::temp_dir().join(format!("pom-ftk-q4-external-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("source.gguf");
+        let header = base.join("header.gguf");
+        let (hidden, intermediate) = write_q4_source(&path);
+        write_external_data_header(&path, &header);
+        assert!(
+            std::fs::metadata(&header).unwrap().len() < std::fs::metadata(&path).unwrap().len()
+        );
+
+        let direct = Q4_0Source::open_infer(&path, 2).unwrap();
+        let virtual_source = Q4_0Source::open_infer(&header, 2).unwrap();
+        for expert in 0..2 {
+            assert_eq!(
+                virtual_source.load_expert(0, expert).unwrap(),
+                direct.load_expert(0, expert).unwrap()
+            );
+        }
+        assert_eq!(
+            virtual_source.router_logits(0, &[1.0; 32]).unwrap(),
+            direct.router_logits(0, &[1.0; 32]).unwrap()
+        );
+        let expert = virtual_source.load_expert(0, 1).unwrap();
+        Q4_0Expert::from_payload(hidden, intermediate, &expert).unwrap();
+        drop((direct, virtual_source));
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

@@ -13,13 +13,12 @@ use super::format_legacy_quants::{decode_row as legacy_decode_row, LegacyQuantFo
 use super::format_low_bits::{decode_row as low_bit_decode_row, LowBitFormat};
 use super::format_plain::PlainFormat;
 use super::format_q4_0::{
-    decode_row as q4_decode_row, parse_tensor_table, read_scalar_vector, Q4LoadError, TensorSpec,
+    decode_row as q4_decode_row, read_scalar_vector, Q4LoadError, TensorSpec,
 };
 use super::router::dispatch_route_parallel;
 use memmap2::Mmap;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -286,11 +285,7 @@ impl HeterogeneousMoeSource {
         if experts == 0 {
             return Err(Q4LoadError::InvalidTensor("contagem de experts zero"));
         }
-        let file = File::open(path.as_ref()).map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        // SAFETY: the file descriptor remains valid while mmap is created.
-        let mmap =
-            unsafe { Mmap::map(&file) }.map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        let (data_start, tensors) = parse_tensor_table(&mmap)?;
+        let (mmap, data_start, tensors) = super::format_q4_0::map_tensor_source(path.as_ref())?;
         let sidecars = load_sidecars(&mmap, data_start, &tensors)?;
         let mut max_layer = None;
         let mut expert_entries = Vec::new();

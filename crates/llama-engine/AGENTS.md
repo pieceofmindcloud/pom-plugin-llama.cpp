@@ -116,6 +116,14 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
   (`mtp_context_to_ram_turns_off_the_cache_offload` em `mtp.rs`), e a
   camada 1 no espelhamento exato de `load_mtp_cpu` (mesmo padrão, já usado
   em produção para o `nextn` embutido).
+- `moe/` file access: every expert reader opens the model through
+  `format_q4_0::map_tensor_source`. For a header-only virtual slice (the
+  `general.external_data.*` keys the POM writes and the llama.cpp fork's
+  `pom-external-data` branch loads), it maps the one source file the tensors
+  point into and returns `data_start = 0` with absolute offsets, so the
+  readers keep indexing `data_start + offset`. A source in more than one file
+  is refused for the executor. Test:
+  `format_q4_0::tests::a_header_with_external_data_reads_the_experts_from_the_source_file`.
 - `moe/` - executor MoE próprio (denso + esparso), com kernels CUDA em
   `moe/cuda_kernels.cu` compilados por `build.rs` sob `--features cuda`
   (no alvo MSVC: `-Xcompiler /MD` e `pom_moe_cuda.lib` via `lib.exe`; nos

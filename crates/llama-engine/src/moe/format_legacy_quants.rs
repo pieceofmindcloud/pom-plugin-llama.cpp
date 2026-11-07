@@ -5,10 +5,9 @@
 //! permanece separado do decoder para que um dtype nunca seja lido como outro.
 
 use super::cache::{CacheError, ExpertCache, ExpertKey};
-use super::format_q4_0::{parse_tensor_table, Q4LoadError, TensorSpec};
+use super::format_q4_0::{Q4LoadError, TensorSpec};
 use memmap2::Mmap;
 use std::fmt;
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -155,11 +154,7 @@ impl LegacyQuantSource {
         if experts == 0 {
             return Err(Q4LoadError::InvalidTensor("contagem de experts zero"));
         }
-        let file = File::open(path.as_ref()).map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        // SAFETY: Mmap owns the mapping and outlives every returned tensor slice.
-        let mmap =
-            unsafe { Mmap::map(&file) }.map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        let (data_start, tensors) = parse_tensor_table(&mmap)?;
+        let (mmap, data_start, tensors) = super::format_q4_0::map_tensor_source(path.as_ref())?;
         let format = detect_format(&tensors)?;
         let down = tensors_with_suffix(&tensors, "ffn_down_exps.weight");
         if down.is_empty() {

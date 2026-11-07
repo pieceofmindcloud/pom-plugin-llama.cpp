@@ -379,11 +379,7 @@ impl Nvfp4Source {
     ) -> Result<Self, Q4LoadError> {
         Nvfp4Expert::packed_bytes(hidden, intermediate)
             .map_err(|_| Q4LoadError::InvalidTensor("geometria não fecha NVFP4"))?;
-        let file = File::open(path.as_ref()).map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        // SAFETY: the file descriptor stays alive until the mmap is created.
-        let mmap =
-            unsafe { Mmap::map(&file) }.map_err(|error| Q4LoadError::Io(error.to_string()))?;
-        let (data_start, tensors) = parse_tensor_table(&mmap)?;
+        let (mmap, data_start, tensors) = super::format_q4_0::map_tensor_source(path.as_ref())?;
         let mut fused = Vec::new();
         let mut gate = Vec::new();
         let mut up = Vec::new();
