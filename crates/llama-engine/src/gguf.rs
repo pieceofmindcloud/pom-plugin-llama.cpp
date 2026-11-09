@@ -99,15 +99,16 @@ pub const DEEPSEEK41_CANDIDATE_SOURCE_KEY: &str =
 /// dependencies inside one graph, so each one limits the cut:
 /// - a compressed layer reads the KV and the top-k of the latest source layer
 ///   at or before it, so the slice has to start at a layer that is both;
-/// - Engram hashes token ids and only the first slice has them: on an embedding
-///   input the graph skips Engram without an error, so every Engram layer stays
-///   before the cut;
 /// - the layers after the candidate source consume its pin, so the cut cannot
 ///   come after that source.
+///
+/// Engram layers no longer limit it: a slice that starts mid-model gets the
+/// layer-boundary state with the token ids of its rows (`Engine::state_tokens`,
+/// the fork's `deepseek41.cpp` hashing them), so an Engram layer runs in any
+/// slice.
 fn deepseek41_slice_starts(
     kv_sources: &[u32],
     index_sources: &[u32],
-    engram_layers: &[u32],
     candidate_source: Option<u32>,
     total_layers: u32,
 ) -> Vec<u32> {
@@ -116,7 +117,6 @@ fn deepseek41_slice_starts(
         .copied()
         .filter(|&layer| layer > 0 && layer < total_layers)
         .filter(|layer| index_sources.contains(layer))
-        .filter(|&layer| engram_layers.iter().all(|&engram| engram < layer))
         .filter(|&layer| candidate_source.map_or(true, |source| layer <= source))
         .collect();
     starts.sort_unstable();
@@ -1538,7 +1538,9 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
                 .iter()
                 .any(|tensor| tensor.name == "per_layer_token_embd.weight")
         {
-            bail!("a origem {architecture} declara PLE, mas não contém per_layer_token_embd.weight");
+            bail!(
+                "a origem {architecture} declara PLE, mas não contém per_layer_token_embd.weight"
+            );
         }
     }
     if architecture == "deepseek41" {
@@ -1550,7 +1552,6 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
         layout.restricted_slice_starts = Some(deepseek41_slice_starts(
             selected("kv_source_layers"),
             selected("indexer.source_layers"),
-            &ple_layers,
             deepseek41_candidate_source,
             original_block_count,
         ));
@@ -2108,7 +2109,9 @@ mod tests {
             "pom-deepseek41-{}.gguf",
             uuid::Uuid::new_v4().simple()
         ));
-        let mut names: Vec<String> = (0..8).map(|layer| format!("blk.{layer}.attn.weight")).collect();
+        let mut names: Vec<String> = (0..8)
+            .map(|layer| format!("blk.{layer}.attn.weight"))
+            .collect();
         for name in [
             "per_layer_token_embd.weight",
             "token_embd.weight",
@@ -2121,19 +2124,47 @@ mod tests {
         let mut bytes = gguf_with_tensors(
             &[
                 ("general.architecture", T_STRING, b"deepseek41".to_vec()),
-                ("deepseek41.block_count", T_UINT32, 8u32.to_le_bytes().to_vec()),
-                ("deepseek41.attention.kv_source_layers", T_ARRAY, u32_array_kv(&[2, 4])),
-                ("deepseek41.attention.indexer.source_layers", T_ARRAY, u32_array_kv(&[2, 4, 6])),
+                (
+                    "deepseek41.block_count",
+                    T_UINT32,
+                    8u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    "deepseek41.attention.kv_source_layers",
+                    T_ARRAY,
+                    u32_array_kv(&[2, 4]),
+                ),
+                (
+                    "deepseek41.attention.indexer.source_layers",
+                    T_ARRAY,
+                    u32_array_kv(&[2, 4, 6]),
+                ),
                 (
                     "deepseek41.attention.indexer.candidate_source_layer",
                     T_UINT32,
                     candidate.to_le_bytes().to_vec(),
                 ),
                 ("deepseek41.ple.layers", T_ARRAY, u32_array_kv(ple)),
-                ("deepseek41.ple.layer_multipliers", T_ARRAY, u32_array_kv(&[1, 2, 3, 4])),
-                ("deepseek41.ple.head_offsets", T_ARRAY, u32_array_kv(&[0; 12])),
-                ("deepseek41.ple.head_vocab_sizes", T_ARRAY, u32_array_kv(&[7; 12])),
-                ("deepseek41.engram.token_map", T_ARRAY, u32_array_kv(&[0; 16])),
+                (
+                    "deepseek41.ple.layer_multipliers",
+                    T_ARRAY,
+                    u32_array_kv(&[1, 2, 3, 4]),
+                ),
+                (
+                    "deepseek41.ple.head_offsets",
+                    T_ARRAY,
+                    u32_array_kv(&[0; 12]),
+                ),
+                (
+                    "deepseek41.ple.head_vocab_sizes",
+                    T_ARRAY,
+                    u32_array_kv(&[7; 12]),
+                ),
+                (
+                    "deepseek41.engram.token_map",
+                    T_ARRAY,
+                    u32_array_kv(&[0; 16]),
+                ),
             ],
             &names,
         );
@@ -2144,34 +2175,64 @@ mod tests {
 
     #[test]
     fn deepseek41_only_cuts_where_every_cross_layer_source_stays_reachable() {
+        // KV sources 2 and 4, indexer sources 2, 4 and 6, Engram at 1 and 3,
+        // candidate source 4: the cuts are the shared sources up to 4.
         let path = deepseek41_layout_path(&[1, 3], 4);
         let layout = read_layout(&path).unwrap();
         let _ = std::fs::remove_file(path);
 
-        assert_eq!(layout.arch_boundaries(), vec![4]);
-        assert_eq!(layout.valid_prefix_end_layers(), vec![3, 7]);
+        assert_eq!(layout.arch_boundaries(), vec![2, 4]);
+        assert_eq!(layout.valid_prefix_end_layers(), vec![1, 3, 7]);
+        assert!(
+            layout.is_valid_slice_start(2),
+            "Engram at 3 gets the token ids beside the state"
+        );
         assert!(layout.is_valid_slice_start(4));
-        assert!(!layout.is_valid_slice_start(2), "layer 3 uses Engram and would lose its token ids");
+        assert!(
+            !layout.is_valid_slice_start(3),
+            "layer 3 reads layer 2's compressed KV"
+        );
+        assert!(!layout.is_valid_slice_start(6), "past the candidate source");
         assert_eq!(layout.snap_end_layer(0, 5, 8), 3);
-        assert_eq!(layout.snap_end_layer(0, 1, 8), 3, "a short prefix cannot stop before its cut");
-        assert!(layout.validate_slice_ranges(&[(0, 3), (4, 7)]).is_ok());
-        let error = layout.validate_slice_ranges(&[(0, 1), (2, 7)]).unwrap_err().to_string();
-        assert!(error.contains("L2"), "{error}");
+        assert!(layout
+            .validate_slice_ranges(&[(0, 1), (2, 3), (4, 7)])
+            .is_ok());
+        let error = layout
+            .validate_slice_ranges(&[(0, 2), (3, 7)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("L3"), "{error}");
     }
 
     #[test]
-    fn deepseek41_without_a_valid_cut_stays_whole() {
-        // Engram at layer 5 needs token ids, so the cut would have to come after
-        // it, but the candidate pin at layer 4 forbids cutting after layer 4.
+    fn deepseek41_engram_layers_do_not_hold_the_cut_back() {
+        // Engram at 5, after the candidate source at 4: before, no cut was left.
         let path = deepseek41_layout_path(&[1, 5], 4);
         let layout = read_layout(&path).unwrap();
         let _ = std::fs::remove_file(path);
 
-        assert!(layout.arch_boundaries().is_empty());
-        assert_eq!(layout.valid_prefix_end_layers(), vec![7]);
-        assert!(!layout.is_valid_slice_start(4));
+        assert_eq!(layout.arch_boundaries(), vec![2, 4]);
+        assert!(layout.is_valid_slice_start(4));
         assert!(layout.is_valid_slice_start(0));
-        assert_eq!(layout.snap_end_layer(0, 5, 8), 7);
+    }
+
+    #[test]
+    fn deepseek41_cuts_at_every_shared_source_up_to_the_candidate_source() {
+        // DeepSeek-V4.1-Flash: KV sources 2, 8, 14, 20; Engram at 1 and 14; candidate source 20.
+        assert_eq!(
+            deepseek41_slice_starts(
+                &[2, 8, 14, 20],
+                &[2, 8, 14, 20, 24, 28, 32, 36],
+                Some(20),
+                40
+            ),
+            vec![2, 8, 14, 20]
+        );
+        // Nothing past the candidate source, nor a source the indexer does not share.
+        assert_eq!(
+            deepseek41_slice_starts(&[2, 8, 30], &[2, 30], Some(20), 40),
+            vec![2]
+        );
     }
 
     #[test]

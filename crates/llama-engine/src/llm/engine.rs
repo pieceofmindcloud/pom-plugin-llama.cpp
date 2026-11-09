@@ -1837,6 +1837,20 @@ impl LlmEngine {
         let mut batch = unsafe { sys::llama_batch_init(n, input_width_i32, 1) };
         batch.n_tokens = n;
         batch.token = ptr::null_mut();
+        // Token ids beside the state (see `state_tokens`), only when every
+        // entry brought them: llama.cpp takes them for the whole batch or not
+        // at all.
+        let all_ids: Option<Vec<i32>> = entries
+            .iter()
+            .map(|entry| entry.tokens.as_deref())
+            .collect::<Option<Vec<&[i32]>>>()
+            .map(|parts| parts.concat());
+        let mut state_ids: Option<Vec<i32>> = self
+            .state_tokens(input_width, layout.total_tokens(), all_ids.as_deref())
+            .map(<[i32]>::to_vec);
+        if let Some(ids) = state_ids.as_mut() {
+            batch.token = ids.as_mut_ptr();
+        }
         let mut row = 0usize;
         unsafe {
             for entry in entries {
@@ -1873,6 +1887,8 @@ impl LlmEngine {
         let rc = unsafe { sys::llama_decode(self.ctx, batch) };
         let backend_call_us = backend_call_started.elapsed().as_micros() as u64;
         batch.pos = scalar_positions;
+        batch.token = ptr::null_mut();
+        drop(state_ids);
         unsafe { sys::llama_batch_free(batch) };
         if rc != 0 {
             bail!("llama_decode (hidden batch) failed rc={rc}");
@@ -2170,6 +2186,10 @@ impl LlmEngine {
     /// `nextn` não roda (ver `mtp_skip_observe`). É o caminho de toda rodada
     /// de decode da cauda sem `mtp_k`, que no stream remoto de dois ou mais
     /// hops é todo token.
+    ///
+    /// `tokens` are the batch's token ids, for a model whose boundary state
+    /// carries them (`state_tokens`); they do not feed the `nextn` head here.
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_hidden_without_mtp(
         &mut self,
         hidden: &[f32],
@@ -2178,6 +2198,7 @@ impl LlmEngine {
         pos_offset: u32,
         seq_id: u32,
         logits_all: bool,
+        tokens: Option<&[i32]>,
     ) -> Result<DecodeTimings> {
         self.decode_hidden_inner(
             hidden,
@@ -2188,7 +2209,26 @@ impl LlmEngine {
             logits_all,
             MtpObserve::Skip,
             None,
+            tokens,
         )
+    }
+
+    /// The token ids to send beside a hidden state of `input_width`, or
+    /// `None`. A DeepSeek-V4.1 slice that starts mid-model gets the
+    /// layer-boundary state (`n_embd_out` wide: the hc streams plus the
+    /// pending pre-mix) and hashes the ids for its Engram layers; without them
+    /// llama.cpp skips Engram, which is only right for image positions.
+    fn state_tokens<'a>(
+        &self,
+        input_width: usize,
+        n_tokens: usize,
+        tokens: Option<&'a [i32]>,
+    ) -> Option<&'a [i32]> {
+        let tokens = tokens.filter(|ids| ids.len() == n_tokens)?;
+        (input_width == self.n_embd_out
+            && self.n_embd_out != self.n_embd
+            && self.model_architecture().as_deref() == Some("deepseek41"))
+        .then_some(tokens)
     }
 
     /// Decode hidden states while preserving the physical-to-logical position
@@ -2216,6 +2256,7 @@ impl LlmEngine {
             logits_all,
             MtpObserve::Tokens(tokens),
             mrope_positions,
+            tokens,
         )
     }
 
@@ -2230,6 +2271,7 @@ impl LlmEngine {
         logits_all: bool,
         observe: MtpObserve<'_>,
         mrope_positions: Option<&[[u32; 4]]>,
+        row_tokens: Option<&[i32]>,
     ) -> Result<DecodeTimings> {
         self.ensure_moe_executor_ready()?;
         if let Some(positions) = mrope_positions {
@@ -2273,6 +2315,14 @@ impl LlmEngine {
         let mut batch = unsafe { sys::llama_batch_init(n, input_width_i32, 1) };
         batch.n_tokens = n;
         batch.token = ptr::null_mut(); // signals embedding mode
+                                       // Token ids beside the state (see `state_tokens`): the batch borrows
+                                       // this vector, and the pointer goes back to null before the free.
+        let mut state_ids: Option<Vec<i32>> = self
+            .state_tokens(input_width, n_tokens, row_tokens)
+            .map(<[i32]>::to_vec);
+        if let Some(ids) = state_ids.as_mut() {
+            batch.token = ids.as_mut_ptr();
+        }
 
         unsafe {
             // Copy the flat embedding data into the batch's embd buffer.
@@ -2301,6 +2351,8 @@ impl LlmEngine {
         let rc = unsafe { sys::llama_decode(self.ctx, batch) };
         let backend_call_us = backend_call_started.elapsed().as_micros() as u64;
         batch.pos = scalar_positions;
+        batch.token = ptr::null_mut();
+        drop(state_ids);
         unsafe { sys::llama_batch_free(batch) };
         if rc != 0 {
             bail!("llama_decode (hidden) failed rc={rc}");

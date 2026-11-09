@@ -125,6 +125,10 @@ pub struct HiddenBatchEntry {
     /// Four M-RoPE coordinates per physical embedding cell, in `[t, y, x, z]`
     /// order. `None` keeps the ordinary one-dimensional position path.
     pub mrope_positions: Option<Vec<[u32; 4]>>,
+    /// The token ids of the rows, as the head tokenized them. A model whose
+    /// layer-boundary state needs them (`Engine::state_tokens`) gets them
+    /// beside the state; `None` sends the state alone.
+    pub tokens: Option<Vec<i32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
