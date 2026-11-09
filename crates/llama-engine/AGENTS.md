@@ -119,7 +119,7 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
 - `moe/` file access: every expert reader opens the model through
   `format_q4_0::map_tensor_source`. For a header-only virtual slice (the
   `general.external_data.*` keys the POM writes and the llama.cpp fork's
-  `pom-external-data` branch loads), it maps the one source file the tensors
+  `pom` branch loads), it maps the one source file the tensors
   point into and returns `data_start = 0` with absolute offsets, so the
   readers keep indexing `data_start + offset`. A source in more than one file
   is refused for the executor. Test:
