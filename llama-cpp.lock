@@ -2,4 +2,4 @@
 # commit. Used by CI and by the POM's Docker build to fetch the same source.
 LLAMA_CPP_REPOSITORY=https://github.com/pieceofmindcloud/llama.cpp.git
 LLAMA_CPP_BRANCH=pom
-LLAMA_CPP_COMMIT=146251d8201377c6196ac3a3e3d31df9a2965d5b
+LLAMA_CPP_COMMIT=d6cb7a42851d24efb65c486a3b2550044f108c4d

@@ -710,6 +710,285 @@ mod tests {
     /// (`batch.token = NULL`, data in `batch.embd`) and therefore a different
     /// graph. Set `POM_TEST_GPU_LAYERS=99` to run it with the weights
     /// offloaded, which is how every real peer runs it.
+    /// A DeepSeek-V4.1 model run whole and as slices chained through the
+    /// layer-boundary state (`decode_tokens`, `take_residual`, `decode_hidden`
+    /// with the token ids, as a pipeline's stages do) must pick the same
+    /// tokens. CPU only, on a real model:
+    ///
+    /// ```text
+    /// POM_DSV41_WHOLE=<first part of the whole GGUF> \
+    /// POM_DSV41_SLICES=<slice 0>,<slice 1>,... \
+    /// cargo test -p llama-engine --lib deepseek41_slices_chain_like_the_whole_model -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a real DeepSeek-V4.1 GGUF and its slices"]
+    fn deepseek41_slices_chain_like_the_whole_model() {
+        let _guard = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let whole = std::env::var("POM_DSV41_WHOLE").expect("POM_DSV41_WHOLE");
+        let slices: Vec<String> = std::env::var("POM_DSV41_SLICES")
+            .expect("POM_DSV41_SLICES")
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        let steps: usize = std::env::var("POM_DSV41_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6);
+        let cfg = |need_embeddings| EngineConfig {
+            n_ctx: 256,
+            mmproj_path: None,
+            mtp_draft_path: None,
+            offload_kqv: false,
+            cache_type_k: KvCacheType::F16,
+            cache_type_v: KvCacheType::F16,
+            fit_memory: false,
+            fit_memory_margin_mb: crate::DEFAULT_FIT_MEMORY_MARGIN_MB,
+            n_batch: 256,
+            n_ubatch: crate::DEFAULT_N_UBATCH,
+            n_gpu_layers: 0,
+            n_threads: std::thread::available_parallelism()
+                .map(|n| n.get() as i32)
+                .unwrap_or(8),
+            max_sessions: 1,
+            need_embeddings,
+            mtp: false,
+            mtp_cpu_fallback_enabled: false,
+            mtp_placement: Default::default(),
+            moe_experts_in_ram: false,
+            moe_cache_mib: 0,
+            rs_seq_window: 0,
+            moe_external_executor: false,
+            moe_external_executor_layers: Vec::new(),
+        };
+        let argmax = |logits: &[f32]| {
+            logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as i32)
+                .unwrap()
+        };
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (na * nb)
+        };
+
+        let text = |engine: &LlmEngine, tokens: &[i32]| {
+            String::from_utf8_lossy(
+                &tokens
+                    .iter()
+                    .flat_map(|t| engine.token_to_piece_bytes(*t, false))
+                    .collect::<Vec<_>>(),
+            )
+            .into_owned()
+        };
+        // the whole model: greedy tokens and the logits of each step (POM_DSV41_REF caches them in a file)
+        let reference = std::env::var("POM_DSV41_REF").ok();
+        let cached = reference
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .map(|bytes| {
+                let words: Vec<u32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                let (n_prompt, n_steps, n_vocab) =
+                    (words[0] as usize, words[1] as usize, words[2] as usize);
+                let mut at = 3;
+                let prompt: Vec<i32> = words[at..at + n_prompt].iter().map(|w| *w as i32).collect();
+                at += n_prompt;
+                let tokens: Vec<i32> = words[at..at + n_steps].iter().map(|w| *w as i32).collect();
+                at += n_steps;
+                let logits: Vec<Vec<f32>> = (0..n_steps)
+                    .map(|s| {
+                        words[at + s * n_vocab..at + (s + 1) * n_vocab]
+                            .iter()
+                            .map(|w| f32::from_bits(*w))
+                            .collect()
+                    })
+                    .collect();
+                (prompt, tokens, logits)
+            });
+        let (prompt, whole_tokens, whole_logits) = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut engine =
+                LlmEngine::load_with_cache(&whole, &cfg(false), &ModelCache::new(), false)
+                    .expect("whole model loads");
+            let prompt = engine.tokenize("Oi, teste. Responda em uma frase:", true, true);
+            let mut whole_tokens = Vec::new();
+            let mut whole_logits = Vec::new();
+            engine.decode_tokens(&prompt, 0, 0, false).unwrap();
+            for step in 0..steps {
+                let logits = engine.logits_ith(-1).to_vec();
+                let next = argmax(&logits);
+                whole_tokens.push(next);
+                whole_logits.push(logits);
+                let pos = (prompt.len() + step) as u32;
+                engine.decode_tokens(&[next], pos, 0, false).unwrap();
+            }
+            eprintln!(
+                "whole : {:?} {:?}",
+                whole_tokens,
+                text(&engine, &whole_tokens)
+            );
+            if let Some(path) = &reference {
+                let mut words = vec![
+                    prompt.len() as u32,
+                    steps as u32,
+                    whole_logits[0].len() as u32,
+                ];
+                words.extend(prompt.iter().map(|t| *t as u32));
+                words.extend(whole_tokens.iter().map(|t| *t as u32));
+                words.extend(whole_logits.iter().flatten().map(|v| v.to_bits()));
+                std::fs::write(
+                    path,
+                    words
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                )
+                .unwrap();
+            }
+            (prompt, whole_tokens, whole_logits)
+        };
+        let steps = steps.min(whole_tokens.len());
+
+        // the slices: tokens into the first, the state on through the others with the token ids
+        let mut stages: Vec<LlmEngine> = slices
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                LlmEngine::load_with_cache(
+                    path,
+                    &cfg(i + 1 < slices.len()),
+                    &ModelCache::new(),
+                    false,
+                )
+                .expect("slice loads")
+            })
+            .collect();
+        let run = |stages: &mut Vec<LlmEngine>, tokens: &[i32], pos: u32| -> Vec<f32> {
+            let n = tokens.len();
+            stages[0].decode_tokens(tokens, pos, 0, true).unwrap();
+            let mut state = stages[0].take_residual(n).unwrap();
+            for k in 1..stages.len() {
+                let last = k + 1 == stages.len();
+                eprintln!("  stage {k} gets state shape {:?}", state.shape);
+                stages[k]
+                    .decode_hidden(&state.values, &state.shape, n, pos, 0, !last, Some(tokens))
+                    .unwrap();
+                if !last {
+                    state = stages[k].take_residual(n).unwrap();
+                }
+            }
+            stages.last().unwrap().logits_ith(-1).to_vec()
+        };
+        let mut chain_tokens = Vec::new();
+        let mut logits = run(&mut stages, &prompt, 0);
+        for step in 0..steps {
+            let next = argmax(&logits);
+            eprintln!(
+                "step {step}: whole {} chain {next} cosine {:.6}",
+                whole_tokens[step],
+                cosine(&logits, &whole_logits[step])
+            );
+            chain_tokens.push(next);
+            // follow the whole model's tokens so every step compares the same context
+            logits = run(
+                &mut stages,
+                &[whole_tokens[step]],
+                (prompt.len() + step) as u32,
+            );
+        }
+        eprintln!(
+            "chain : {:?} {:?}",
+            chain_tokens,
+            text(stages.last().unwrap(), &chain_tokens)
+        );
+        assert_eq!(chain_tokens, whole_tokens);
+    }
+
+    /// The state a DeepSeek-V4.1 slice hands on matches the whole model's hc
+    /// streams at the same layer (`l_out-<last layer>`).
+    ///
+    /// ```text
+    /// POM_DSV41_WHOLE=<whole GGUF> POM_DSV41_SLICE=<slice from layer 0> \
+    /// cargo test -p llama-engine --lib deepseek41_first_slice_state_matches_the_whole_model -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a real DeepSeek-V4.1 GGUF and a slice"]
+    fn deepseek41_first_slice_state_matches_the_whole_model() {
+        let _guard = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let whole = std::env::var("POM_DSV41_WHOLE").expect("POM_DSV41_WHOLE");
+        let slice = std::env::var("POM_DSV41_SLICE").expect("POM_DSV41_SLICE");
+        let cfg = EngineConfig {
+            n_ctx: 256,
+            mmproj_path: None,
+            mtp_draft_path: None,
+            offload_kqv: false,
+            cache_type_k: KvCacheType::F16,
+            cache_type_v: KvCacheType::F16,
+            fit_memory: false,
+            fit_memory_margin_mb: crate::DEFAULT_FIT_MEMORY_MARGIN_MB,
+            n_batch: 256,
+            n_ubatch: crate::DEFAULT_N_UBATCH,
+            n_gpu_layers: 0,
+            n_threads: std::thread::available_parallelism()
+                .map(|n| n.get() as i32)
+                .unwrap_or(8),
+            max_sessions: 1,
+            need_embeddings: true,
+            mtp: false,
+            mtp_cpu_fallback_enabled: false,
+            mtp_placement: Default::default(),
+            moe_experts_in_ram: false,
+            moe_cache_mib: 0,
+            rs_seq_window: 0,
+            moe_external_executor: false,
+            moe_external_executor_layers: Vec::new(),
+        };
+        let mut part = LlmEngine::load_with_cache(&slice, &cfg, &ModelCache::new(), false)
+            .expect("slice loads");
+        let last = part.n_layer() - 1;
+        let prompt = part.tokenize("Oi, teste. Responda em uma frase:", true, true);
+        let n = prompt.len();
+        part.decode_tokens(&prompt, 0, 0, true).unwrap();
+        let state = part.take_residual(n).unwrap();
+        drop(part);
+
+        let mut engine = LlmEngine::load_with_cache(&whole, &cfg, &ModelCache::new(), false)
+            .expect("whole loads");
+        engine.set_capture_layer(Some(last)).unwrap();
+        engine.decode_tokens(&prompt, 0, 0, true).unwrap();
+        let reference = engine.take_residual(n).unwrap();
+        eprintln!(
+            "slice state {:?}, whole l_out-{last} {:?}",
+            state.shape, reference.shape
+        );
+
+        let n_embd = engine.n_embd;
+        let streams = reference.values.len() / (n * n_embd);
+        let width = state.values.len() / n;
+        let mut worst = 0f64;
+        for t in 0..n {
+            let a = &state.values[t * width..t * width + streams * n_embd];
+            let b = &reference.values[t * streams * n_embd..(t + 1) * streams * n_embd];
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (na * nb);
+            eprintln!("token {t}: cosine {cos:.6} |slice| {na:.3} |whole| {nb:.3}");
+            worst = worst.max(1.0 - cos);
+        }
+        assert!(
+            worst < 1e-3,
+            "the slice's hc streams diverge from the whole model's"
+        );
+    }
+
     #[test]
     fn residual_capture_fires_for_an_injected_hidden_state() {
         let _guard = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

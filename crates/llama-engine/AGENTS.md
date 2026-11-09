@@ -231,9 +231,13 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
   (o mesmo vale para `deepseek41`, cujos cortes válidos vêm de
   `restricted_slice_starts`: fonte de KV e de índice, depois de toda camada
   Engram e não depois da fonte de candidatos);
-  os três arrays de estrutura (`layer_multipliers`, `head_offsets` e
-  `head_vocab_sizes`) permanecem completos, enquanto `ple.layers` é filtrado
-  e rebaseado pelo fatiador. `kv_budget.rs` - orçamento de bytes do cache KV
+  em `qwen4exp` os três arrays de estrutura (`layer_multipliers`,
+  `head_offsets` e `head_vocab_sizes`) permanecem completos; em `deepseek41`
+  eles têm um conjunto por camada Engram e o fatiador do POM os corta junto com
+  `ple.layers`, que é filtrado e rebaseado. Uma fatia `deepseek41` do meio
+  recebe o estado de fronteira com os ids dos tokens (`state_tokens`); o teste
+  ignorado `deepseek41_slices_chain_like_the_whole_model` compara fatias
+  encadeadas com o modelo inteiro num modelo real. `kv_budget.rs` - orçamento de bytes do cache KV
   por geometria.
 - `kv_cache.rs` - `KvCacheType` (era `node/src/utils/config.rs`; `Config` de
   `node` só o referencia como campo).
