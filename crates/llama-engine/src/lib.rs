@@ -1,7 +1,7 @@
 //! Motor de inferência llama.cpp do POM, isolado de `crates/node`.
 //!
 //! Aqui vive **todo** o código que fala com `llama-cpp-sys-2`: o wrapper FFI
-//! (`llm`), a predição multi-token (`mtp`), o executor MoE próprio (`moe`), a
+//! (`llm`), a predição multi-token (`mtp`), a
 //! barreira de reduce do tensor parallelism (`collective`), a leitura de
 //! cabeçalhos GGUF (`gguf` + `multipart`), o cálculo de orçamento de KV
 //! (`kv_budget`) e o monitor de sistema/GPU (`sysmon`). `crates/node` depende
@@ -22,7 +22,6 @@ pub mod kv_budget;
 pub mod kv_cache;
 #[path = "llm/mod.rs"]
 pub mod llm;
-pub mod moe;
 pub mod mtp;
 pub mod mtp_draft;
 pub mod multipart;

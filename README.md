@@ -7,8 +7,7 @@ do POM carrega este crate e roda a inferência no mesmo processo e na mesma GPU
 ## Conteúdo
 
 - `crates/llama-engine` - todo o código Rust que fala com `llama-cpp-sys-2`:
-  wrapper FFI (`llm`), predição multi-token (`mtp`), executor MoE próprio
-  (`moe`, com kernels CUDA em `cuda_kernels.cu`), tensor parallelism
+  wrapper FFI (`llm`), predição multi-token (`mtp`), tensor parallelism
   (`collective`), leitura de cabeçalhos GGUF (`gguf`, `multipart`), orçamento de
   KV (`kv_budget`) e monitor de sistema (`sysmon`).
 - `vendor/llama-cpp-sys-2` - o binding `-sys`, vendorado, que compila o

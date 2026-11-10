@@ -169,7 +169,7 @@ extern "C" int llama_rs_fit_params(
     enum ggml_log_level log_level) {
     common_log_trace_guard trace;
     return static_cast<int>(common_fit_params(
-        path_model,
+        { std::string(path_model) },
         mparams,
         cparams,
         tensor_split,

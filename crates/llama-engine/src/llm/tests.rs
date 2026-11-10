@@ -234,26 +234,24 @@ mod tests {
             7,
             false,
             false,
-            false,
-            Vec::new(),
         );
 
         let first = cache
-            .get("model.gguf", false, false, false, &[])
+            .get("model.gguf", false, false)
             .unwrap()
             .loaded;
         let second = cache
-            .get("model.gguf", false, false, false, &[])
+            .get("model.gguf", false, false)
             .unwrap()
             .loaded;
         assert!(Arc::ptr_eq(&first, &second));
-        assert!(cache.get("model.gguf", false, true, false, &[]).is_none());
-        assert!(cache.get("other.gguf", false, false, false, &[]).is_none());
-        assert!(cache.get("model.gguf", true, false, false, &[]).is_none());
+        assert!(cache.get("model.gguf", false, true).is_none());
+        assert!(cache.get("other.gguf", false, false).is_none());
+        assert!(cache.get("model.gguf", true, false).is_none());
 
         drop((first, second));
         cache.clear();
-        assert!(cache.get("model.gguf", false, false, false, &[]).is_none());
+        assert!(cache.get("model.gguf", false, false).is_none());
         assert_eq!(Arc::strong_count(&loaded), 1);
     }
 
@@ -274,12 +272,10 @@ mod tests {
             7,
             false,
             true,
-            false,
-            Vec::new(),
         );
 
         assert!(cache.clear_mtp_fallback());
-        assert!(cache.get("model.gguf", true, true, false, &[]).is_none());
+        assert!(cache.get("model.gguf", true, true).is_none());
         assert!(!cache.clear_mtp_fallback());
         assert_eq!(Arc::strong_count(&loaded), 1);
     }
@@ -301,11 +297,9 @@ mod tests {
             7,
             false,
             false,
-            false,
-            Vec::new(),
         );
 
-        assert!(cache.get("model.gguf", true, false, false, &[]).is_none());
+        assert!(cache.get("model.gguf", true, false).is_none());
         assert!(cache.clear_mtp_fallback());
         assert_eq!(Arc::strong_count(&loaded), 1);
     }
@@ -542,8 +536,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: Some(mmproj_path),
             mtp_draft_path: None,
         };
@@ -585,8 +577,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         };
@@ -613,7 +603,6 @@ mod tests {
             engine.n_embd_out,
             engine.n_vocab,
             None,
-            false,
             false,
         )
         .expect("a guarda interna deve recusar sem abortar");
@@ -663,8 +652,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         };
@@ -757,8 +744,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
         };
         let argmax = |logits: &[f32]| {
             logits
@@ -947,8 +932,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
         };
         let mut part = LlmEngine::load_with_cache(&slice, &cfg, &ModelCache::new(), false)
             .expect("slice loads");
@@ -1017,8 +1000,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
         };
         let mut engine = LlmEngine::load_with_cache(&path, &cfg, &ModelCache::new(), false)
             .expect("model loads");
@@ -1051,215 +1032,6 @@ mod tests {
         );
     }
 
-    /// Prova E2E do contrato que falhou em produção: o mesmo hidden e o mesmo
-    /// GGUF passam pelo bloco nativo e pelo callback externo CUDA, e a captura
-    /// é feita exatamente depois da camada 1. Além de comparar o residual,
-    /// exige que toda chamada observada tenha usado CUDA. Assim um callback que
-    /// leia a rota com passo errado ou uma área ainda não materializada falha
-    /// antes de poder parecer uma divergência de quantização.
-    ///
-    /// ```text
-    /// POM_MOE_NUMERIC_MODEL=/caminho/qwen35moe.gguf \
-    /// POM_MOE_NUMERIC_GPU_LAYERS=99 \
-    /// cargo test -p node --features cuda --bin pom \
-    ///   inference::llm::pool_tests::qwen35moe_external_route_matches_native_at_layer \
-    ///   -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "requer GGUF qwen35moe e CUDA real"]
-    fn qwen35moe_external_route_matches_native_at_layer() {
-        let _guard = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(cfg!(feature = "cuda"), "rode com --features cuda");
-
-        let path = std::env::var("POM_MOE_NUMERIC_MODEL")
-            .expect("POM_MOE_NUMERIC_MODEL deve apontar para um GGUF qwen35moe");
-        let info = crate::gguf::read_info(std::path::Path::new(&path))
-            .expect("o cabeçalho GGUF deve ser legível");
-        assert_eq!(
-            info.architecture.as_deref(),
-            Some("qwen35moe"),
-            "o teste é específico para a rota do qwen35moe"
-        );
-        assert_eq!(
-            crate::moe::format_q4_0::detect_expert_format(&path)
-                .expect("o formato dos experts deve ser detectável"),
-            crate::moe::format_q4_0::ExpertFormat::Heterogeneous,
-            "o Ornith deve passar pelo inventário heterogêneo Q4_K/Q6_K"
-        );
-        let expert_dtypes = crate::moe::format_q4_0::detect_expert_dtypes(&path)
-            .expect("os dtypes dos experts devem ser detectáveis");
-        assert!(
-            expert_dtypes.contains(&12) && expert_dtypes.contains(&14),
-            "a prova precisa incluir Q4_K e Q6_K: {expert_dtypes:?}"
-        );
-        let experts = info
-            .expert_count
-            .expect("qwen35moe deve declarar expert_count");
-        let top_k = info.expert_used_count.unwrap_or(1).max(1) as usize;
-        let layer = std::env::var("POM_MOE_NUMERIC_LAYER")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(1);
-        let gpu_layers = std::env::var("POM_MOE_NUMERIC_GPU_LAYERS")
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(99);
-        let plan = crate::moe::runtime::MoeRuntime::external_executor_plan(&path)
-            .expect("o planejamento de ownership MoE deve funcionar");
-        assert_eq!(
-            plan.layers.get(layer as usize).copied(),
-            Some(1),
-            "a camada {layer} não tem executor externo CUDA: {:?}",
-            plan.reason
-        );
-
-        let config = |external| EngineConfig {
-            n_ctx: 512,
-            mmproj_path: None,
-            mtp_draft_path: None,
-            offload_kqv: true,
-            cache_type_k: KvCacheType::F16,
-            cache_type_v: KvCacheType::F16,
-            fit_memory: false,
-            fit_memory_margin_mb: crate::DEFAULT_FIT_MEMORY_MARGIN_MB,
-            n_batch: 4,
-            n_ubatch: crate::DEFAULT_N_UBATCH,
-            n_gpu_layers: gpu_layers,
-            n_threads: 2,
-            max_sessions: 1,
-            need_embeddings: true,
-            mtp: false,
-            mtp_cpu_fallback_enabled: true,
-            mtp_placement: Default::default(),
-            moe_experts_in_ram: false,
-            moe_cache_mib: 0,
-            rs_seq_window: 0,
-            moe_external_executor: external,
-            moe_external_executor_layers: if external {
-                plan.layers.clone()
-            } else {
-                Vec::new()
-            },
-        };
-
-        let mut native =
-            LlmEngine::load_with_cache(&path, &config(false), &ModelCache::new(), false)
-                .expect("o modelo nativo deve carregar");
-        native
-            .set_capture_layer(Some(layer))
-            .expect("a camada de captura deve existir");
-        let n_tokens = 4;
-        let hidden: Vec<f32> = (0..n_tokens * native.n_embd)
-            .map(|index| ((index % 127) as f32 - 63.0) / 63.0)
-            .collect();
-        native
-            .decode_hidden(
-                &hidden,
-                &vec![n_tokens, native.n_embd],
-                n_tokens,
-                0,
-                0,
-                true,
-                None,
-            )
-            .expect("o caminho nativo deve decodificar");
-        let native_residual = native
-            .take_residual(n_tokens)
-            .expect("o residual nativo deve ser capturado");
-        drop(native);
-
-        let mut external =
-            LlmEngine::load_with_cache(&path, &config(true), &ModelCache::new(), false)
-                .expect("o modelo em modo metadata-only deve carregar");
-        external
-            .set_capture_layer(Some(layer))
-            .expect("a camada de captura deve existir");
-        let weights_bytes = std::fs::metadata(&path).expect("o GGUF deve existir").len();
-        let cuda_compute_bytes = external
-            .cuda_compute_bytes_by_device()
-            .expect("o contexto deve expor um compute buffer CUDA medido");
-        let runtime = std::sync::Arc::new(
-            crate::moe::runtime::MoeRuntime::open(
-                &path,
-                "qwen35moe-numeric-proof",
-                experts,
-                top_k,
-                weights_bytes,
-                Some(cuda_compute_bytes),
-            )
-            .expect("o runtime externo deve abrir os experts roteados"),
-        );
-        external
-            .set_moe_runtime(runtime)
-            .expect("o callback MoE deve instalar");
-        let timings = external
-            .decode_hidden(
-                &hidden,
-                &vec![n_tokens, external.n_embd],
-                n_tokens,
-                0,
-                0,
-                true,
-                None,
-            )
-            .expect("a rota externa deve decodificar sem NaN");
-        let external_residual = external
-            .take_residual(n_tokens)
-            .expect("o residual externo deve ser capturado");
-
-        assert!(timings.moe_forward_us > 0, "o callback MoE não foi medido");
-        assert!(
-            !timings.moe_executors.is_empty(),
-            "nenhum callback MoE foi observado"
-        );
-        assert!(
-            timings
-                .moe_executors
-                .iter()
-                .all(|executor| *executor == crate::moe::runtime::MoeExecutorKind::Cuda),
-            "o teste precisa provar execução CUDA: {:?}",
-            timings.moe_executors
-        );
-        assert!(
-            external_residual
-                .values
-                .iter()
-                .all(|value| value.is_finite()),
-            "o residual externo contém valor não finito"
-        );
-        assert_eq!(native_residual.values.len(), external_residual.values.len());
-
-        let mut max_abs = 0.0f32;
-        let mut max_relative = 0.0f32;
-        let mut max_index = 0usize;
-        for (index, (&expected, &actual)) in native_residual
-            .values
-            .iter()
-            .zip(&external_residual.values)
-            .enumerate()
-        {
-            assert!(
-                expected.is_finite(),
-                "residual nativo não finito no índice {index}"
-            );
-            let absolute = (actual - expected).abs();
-            let relative = absolute / expected.abs().max(1e-3);
-            if absolute > max_abs {
-                max_abs = absolute;
-                max_index = index;
-            }
-            max_relative = max_relative.max(relative);
-            assert!(
-                absolute <= 5e-2 + 2e-2 * expected.abs().max(1.0),
-                "divergência no residual índice {index}: nativo={expected:?}, externo={actual:?}, abs={absolute:?}, rel={relative:?}"
-            );
-        }
-        println!(
-            "MOE_NUMERIC_PROOF layer={layer} tokens={n_tokens} experts={experts} top_k={top_k} max_abs={max_abs:.6e} max_relative={max_relative:.6e} max_index={max_index} executors={:?}",
-            timings.moe_executors
-        );
-    }
-
     #[test]
     fn residual_capture_fires_with_one_row_per_token() {
         let _guard = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1286,8 +1058,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         };
@@ -1344,8 +1114,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         };
@@ -1424,8 +1192,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         };
@@ -1502,8 +1268,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         };
@@ -1550,8 +1314,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         };

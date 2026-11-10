@@ -174,8 +174,6 @@ impl LlmEngine {
                 model_path,
                 mtp_weights_required,
                 false,
-                cfg.moe_external_executor,
-                &cfg.moe_external_executor_layers,
             ) {
                 tracing::info!(
                     model = %model_path,
@@ -496,8 +494,6 @@ impl LlmEngine {
             engine.effective_n_gpu_layers,
             mtp_weights_loaded,
             mtp_fallback_used,
-            engine.moe_external_executor,
-            cfg.moe_external_executor_layers.clone(),
         );
         Ok(engine)
     }
@@ -784,7 +780,6 @@ impl LlmEngine {
                         n_vocab,
                         mtp_model,
                         mtp_offload_kqv,
-                        cfg.moe_external_executor && mtp_loaded.is_none(),
                     ) {
                         Ok(Some(d)) => (Some(d), None, None),
                         Ok(None) => {
@@ -841,13 +836,11 @@ impl LlmEngine {
             effective_n_gpu_layers: cfg.n_gpu_layers,
             effective_n_ubatch: effective_n_ubatch(cfg),
             cparams_snapshot,
-            moe_external_executor: cfg.moe_external_executor,
             vision,
             mtp,
             mtp_unavailable_reason,
             mtp_initial_context_error,
             mtp_allocation,
-            moe_callback: None,
         })
     }
 
@@ -948,7 +941,6 @@ impl LlmEngine {
         seq_id: u32,
         logits_last: bool,
     ) -> Result<MultimodalDecode> {
-        self.ensure_moe_executor_ready()?;
         let vision_ctx = self
             .vision
             .as_ref()
@@ -1027,7 +1019,6 @@ impl LlmEngine {
         let mut new_n_past = n_past as sys::llama_pos;
         self.reset_capture_slot_with_physical_chunks(n_tokens, true);
         let backend_call_started = Instant::now();
-        self.begin_moe_callback();
         let copies = image_embedding_copies(self.n_embd_inp, self.n_embd_out);
         if copies > 1 {
             // The caller asks for outputs (`!is_last`) exactly when this hop
@@ -1069,7 +1060,6 @@ impl LlmEngine {
             unsafe { sys::llama_synchronize(self.ctx) };
             timings.backend_sync_us = sync_started.elapsed().as_micros() as u64;
         }
-        self.finish_moe_callback(&mut timings)?;
         let n_past = u32::try_from(new_n_past)
             .map_err(|_| anyhow::anyhow!("mtmd retornou uma posição lógica inválida"))?;
         Ok(MultimodalDecode {
@@ -1415,23 +1405,6 @@ impl LlmEngine {
         unsafe { json_from_wrapper(|out| sys::llama_rs_context_memory_json(self.ctx, out)) }
     }
 
-    /// Compute buffer CUDA medido pelo próprio llama.cpp para este contexto.
-    ///
-    /// O valor alimenta o orçamento do cache residente de experts. Se a ponte
-    /// de memória não reportar um buffer CUDA completo, devolve `None` para que
-    /// o caminho CUDA seja recusado nominalmente.
-    pub fn cuda_compute_bytes(&self) -> Option<u64> {
-        crate::moe::admission::cuda_compute_bytes_from_llama_memory(&self.context_memory()?)
-    }
-
-    /// Compute buffers CUDA medidos, preservando o ordinal de cada placa.
-    ///
-    /// O executor externo usa este relatório para criar um cache residente por
-    /// GPU, com a mesma topologia `CUDA0`, `CUDA1`, ... do contexto denso.
-    pub fn cuda_compute_bytes_by_device(&self) -> Option<Vec<(u32, u64)>> {
-        crate::moe::admission::cuda_compute_bytes_by_device(&self.context_memory()?)
-    }
-
     pub fn eos_token(&self) -> i32 {
         unsafe { sys::llama_vocab_eos(self.loaded.vocab) }
     }
@@ -1695,7 +1668,6 @@ impl LlmEngine {
         entries: &[TokenBatchEntry],
         need_residual: bool,
     ) -> Result<(BatchDecodeOutput, DecodeTimings)> {
-        self.ensure_moe_executor_ready()?;
         if entries.is_empty() {
             bail!("batch de tokens vazio");
         }
@@ -1735,7 +1707,6 @@ impl LlmEngine {
                 }
             }
         }
-        self.begin_moe_callback();
         let backend_call_started = Instant::now();
         let rc = unsafe { sys::llama_decode(self.ctx, batch) };
         let backend_call_us = backend_call_started.elapsed().as_micros() as u64;
@@ -1752,7 +1723,6 @@ impl LlmEngine {
         entries: &[HiddenBatchEntry],
         need_residual: bool,
     ) -> Result<(BatchDecodeOutput, DecodeTimings)> {
-        self.ensure_moe_executor_ready()?;
         if entries.is_empty() {
             bail!("batch de hidden states vazio");
         }
@@ -1882,7 +1852,6 @@ impl LlmEngine {
         if let Some(storage) = flattened_positions.as_mut() {
             batch.pos = storage.as_mut_ptr();
         }
-        self.begin_moe_callback();
         let backend_call_started = Instant::now();
         let rc = unsafe { sys::llama_decode(self.ctx, batch) };
         let backend_call_us = backend_call_started.elapsed().as_micros() as u64;
@@ -1974,7 +1943,6 @@ impl LlmEngine {
             unsafe { sys::llama_synchronize(self.ctx) };
             timings.backend_sync_us = sync_started.elapsed().as_micros() as u64;
         }
-        self.finish_moe_callback(&mut timings)?;
         Ok((
             BatchDecodeOutput {
                 layout,
@@ -1995,7 +1963,6 @@ impl LlmEngine {
         seq_id: u32,
         logits_all: bool,
     ) -> Result<DecodeTimings> {
-        self.ensure_moe_executor_ready()?;
         // Zera o buffer, e não só o cronômetro: agora que a captura
         // acumula microlote a microlote, sobra do decode anterior seria
         // residual de outra requisição concatenado ao desta.
@@ -2019,7 +1986,6 @@ impl LlmEngine {
         }
 
         let tp_before = crate::tp_probe::reduce_count();
-        self.begin_moe_callback();
         let backend_call_started = Instant::now();
         let rc = unsafe { sys::llama_decode(self.ctx, batch) };
         let backend_call_us = backend_call_started.elapsed().as_micros() as u64;
@@ -2101,7 +2067,6 @@ impl LlmEngine {
             timings.backend_sync_us = sync_started.elapsed().as_micros() as u64;
         }
         timings.mtp_observe_us = self.mtp_observe(Some(tokens), pos_offset, seq_id);
-        self.finish_moe_callback(&mut timings)?;
         Ok(timings)
     }
 
@@ -2273,7 +2238,6 @@ impl LlmEngine {
         mrope_positions: Option<&[[u32; 4]]>,
         row_tokens: Option<&[i32]>,
     ) -> Result<DecodeTimings> {
-        self.ensure_moe_executor_ready()?;
         if let Some(positions) = mrope_positions {
             if positions.len() != n_tokens {
                 bail!(
@@ -2403,7 +2367,6 @@ impl LlmEngine {
             }
             MtpObserve::Skip => self.mtp_skip_observe(seq_id),
         }
-        self.finish_moe_callback(&mut timings)?;
         Ok(timings)
     }
 

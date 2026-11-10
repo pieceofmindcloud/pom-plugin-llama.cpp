@@ -343,8 +343,6 @@ mod pool_tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
         }
     }
 
@@ -382,7 +380,7 @@ mod pool_tests {
     /// A regressão de 2026-08-21: prompt vindo de um cliente OpenAI externo
     /// morria com "got 655360 floats, expected 2621440 (512x5120)".
     ///
-    /// 655360 = 128 x 5120, e 128 era o `FIT_MAX_UBATCH` da altura - hoje ele
+    /// 655360 = 128 x 5120, e 128 era o microlote máximo do fit da altura - hoje ele
     /// vale 512, por escolha do operador. O chunk de 512 tokens virava quatro
     /// microlotes, a captura substituia a cada um, e sobrava so o ultimo
     /// quarto. Pela UI passava despercebido porque prompt curto cabe num
@@ -705,19 +703,6 @@ mod pool_tests {
     }
 
     #[test]
-    fn external_moe_main_context_uses_the_128_exception() {
-        let mut cfg = cfg();
-        cfg.moe_external_executor = true;
-        assert_eq!(cfg.n_batch, 512);
-        assert_eq!(effective_n_ubatch(&cfg), 128);
-
-        let mut params = unsafe { sys::llama_context_default_params() };
-        apply_context_batch_params(&mut params, &cfg);
-        assert_eq!(params.n_batch, 512);
-        assert_eq!(params.n_ubatch, 128);
-    }
-
-    #[test]
     fn context_batch_params_cap_a_large_mtp_batch_with_fit_enabled() {
         let mut cfg = cfg();
         cfg.mtp = true;
@@ -727,7 +712,7 @@ mod pool_tests {
         apply_context_batch_params(&mut params, &cfg);
 
         assert_eq!(params.n_batch, 4096);
-        // 512 fixo de proposito: e a escolha do operador para FIT_MAX_UBATCH e
+        // 512 fixo de proposito: e a escolha do operador para o microlote máximo do fit e
         // ja foi revertida para 128 uma vez. Comparar com a constante deixaria
         // o teste passar na mesma; o literal faz esta mudanca ficar vermelha.
         assert_eq!(params.n_ubatch, 512);

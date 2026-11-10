@@ -210,11 +210,6 @@ pub struct MtpDrafter {
     verify_h: Vec<f32>,
     verify_rows: usize,
     allocation: crate::llm::MtpAllocation,
-    /// O modelo que sustenta este contexto foi carregado com os experts em
-    /// modo metadata-only. Nesse caso o contexto MTP também precisa do hook
-    /// externo; sem ele `llama_decode` recusa o grafo antes de executar a
-    /// cabeça nextn.
-    external_moe_executor: bool,
 }
 
 // SAFETY: o `llama_context` é usado sob o mesmo `Mutex` que serializa o
@@ -226,10 +221,6 @@ impl Drop for MtpDrafter {
     fn drop(&mut self) {
         unsafe {
             if !self.ctx.is_null() {
-                // The callback userdata belongs to the parent engine. Clear
-                // the native hook before freeing this context so a destructor
-                // or an in-flight backend teardown cannot call a dead Arc.
-                sys::llama_set_moe_ffn_callback(self.ctx, None, ptr::null_mut());
                 sys::llama_free(self.ctx);
                 self.ctx = ptr::null_mut();
             }
@@ -325,7 +316,6 @@ impl MtpDrafter {
         n_vocab: usize,
         mtp_model: Option<std::sync::Arc<crate::llm::LoadedModel>>,
         offload_kqv: bool,
-        external_moe_executor: bool,
     ) -> Result<Option<Self>> {
         // `llama_model_n_layer_nextn` is metadata only: it stays positive on
         // a target loaded with `load_mtp=false`, even though its nextn tensor
@@ -392,23 +382,7 @@ impl MtpDrafter {
             verify_h: Vec::new(),
             verify_rows: 0,
             allocation,
-            external_moe_executor,
         }))
-    }
-
-    /// Instala no contexto MTP o mesmo callback que substitui os experts no
-    /// contexto alvo. O modelo externo não contém buffers dos experts por
-    /// desenho; deixar este contexto sem callback faz cada `llama_decode`
-    /// falhar com `rc=-1` e desliga MTP para a sessão.
-    pub fn set_moe_callback(
-        &self,
-        callback: sys::llama_moe_ffn_callback,
-        userdata: *mut std::os::raw::c_void,
-    ) {
-        if !self.external_moe_executor {
-            return;
-        }
-        unsafe { sys::llama_set_moe_ffn_callback(self.ctx, callback, userdata) };
     }
 
     pub fn allocation(&self) -> crate::llm::MtpAllocation {
@@ -701,27 +675,9 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         }
-    }
-
-    #[test]
-    fn mtp_context_keeps_512_with_an_external_moe_executor() {
-        let mut cfg = cfg();
-        cfg.moe_external_executor = true;
-        let params = context_params(&cfg);
-        assert_eq!(params.n_batch, 4096);
-        // 512 é deliberado: o contexto MTP não herda a exceção de 128 do
-        // contexto principal MoE.
-        assert_eq!(params.n_ubatch, 512);
-
-        cfg.fit_memory = false;
-        let params = context_params(&cfg);
-        assert_eq!(params.n_batch, 4096);
-        assert_eq!(params.n_ubatch, 4096);
     }
 
     #[test]
@@ -851,8 +807,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         };
@@ -972,8 +926,6 @@ mod tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: Some(draft_path.clone()),
         };

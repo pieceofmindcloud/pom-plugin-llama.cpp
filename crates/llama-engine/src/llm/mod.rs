@@ -41,10 +41,7 @@ pub(crate) use std::ffi::{c_void, CStr, CString};
 pub(crate) use std::ops::Range;
 pub(crate) use std::path::Path;
 pub(crate) use std::ptr;
-pub(crate) use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex, OnceLock,
-};
+pub(crate) use std::sync::{Arc, Mutex};
 pub(crate) use std::time::Instant;
 pub(crate) use tracing::warn;
 

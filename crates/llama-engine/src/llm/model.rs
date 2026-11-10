@@ -219,10 +219,6 @@ pub struct LlmEngine {
     /// O que foi pedido ao `llama_new_context_with_model` e não pode ser
     /// consultado de volta. Ver `ContextParamsSnapshot`.
     pub(super) cparams_snapshot: ContextParamsSnapshot,
-    /// Whether llama.cpp loaded this model in metadata-only external-MoE mode.
-    /// This is part of the engine identity because a dense/native context and
-    /// an external-executor context cannot share the same loaded model.
-    pub(super) moe_external_executor: bool,
     /// Projector de visão carregado com o modelo, quando a implantação o pediu.
     pub(super) vision: Option<VisionContext>,
     /// A cabeça de rascunho `nextn`, quando o modelo traz uma e o operador
@@ -236,7 +232,6 @@ pub struct LlmEngine {
     pub(super) mtp_initial_context_error: Option<String>,
     /// Onde o contexto MTP pronto ficou, medido nos buffers reais.
     pub(super) mtp_allocation: Option<MtpAllocation>,
-    pub(super) moe_callback: Option<Arc<MoeCallbackState>>,
 }
 
 /// Pesos mantidos entre gerações do servidor para que uma reconfiguração de
@@ -260,8 +255,6 @@ pub(super) struct CachedModel {
     /// reuse this target model after that fallback or the next reconstruction
     /// would need a companion that the cache does not own.
     pub(super) mtp_fallback_used: bool,
-    pub(super) moe_external_executor: bool,
-    pub(super) moe_external_executor_layers: Vec<u8>,
 }
 
 impl ModelCache {
@@ -274,8 +267,6 @@ impl ModelCache {
         model_path: &str,
         mtp_weights_loaded: bool,
         mtp_fallback_used: bool,
-        moe_external_executor: bool,
-        moe_external_executor_layers: &[u8],
     ) -> Option<CachedModel> {
         let entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
         entry
@@ -284,8 +275,6 @@ impl ModelCache {
                 cached.model_path == model_path
                     && cached.mtp_weights_loaded == mtp_weights_loaded
                     && cached.mtp_fallback_used == mtp_fallback_used
-                    && cached.moe_external_executor == moe_external_executor
-                    && cached.moe_external_executor_layers == moe_external_executor_layers
             })
             .cloned()
     }
@@ -298,8 +287,6 @@ impl ModelCache {
         effective_n_gpu_layers: i32,
         mtp_weights_loaded: bool,
         mtp_fallback_used: bool,
-        moe_external_executor: bool,
-        moe_external_executor_layers: Vec<u8>,
     ) {
         let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
         *entry = Some(CachedModel {
@@ -309,8 +296,6 @@ impl ModelCache {
             effective_n_gpu_layers,
             mtp_weights_loaded,
             mtp_fallback_used,
-            moe_external_executor,
-            moe_external_executor_layers,
         });
     }
 
@@ -358,9 +343,6 @@ pub struct DecodeTimings {
     pub residual_capture_postprocess_us: u64,
     pub residual_capture_bytes: u64,
     pub residual_capture_copies: u64,
-    pub moe_forward_us: u64,
-    pub moe_executors: Vec<crate::moe::runtime::MoeExecutorKind>,
-    pub moe_executor: Option<crate::moe::runtime::MoeExecutorTelemetry>,
 }
 
 /// **Ligado por padrão** desde 2026-08-13; `POM_PROFILE_SYNC=0` desliga.
@@ -416,84 +398,15 @@ impl LlmEngine {
         self.vision = None;
         unsafe {
             if !self.ctx.is_null() {
-                sys::llama_set_moe_ffn_callback(self.ctx, None, ptr::null_mut());
                 sys::llama_free(self.ctx);
                 self.ctx = std::ptr::null_mut();
             }
         }
-        self.moe_callback = None;
         // Os pesos só saem se este era o último contexto sobre eles; com um
         // irmão vivo, `get_mut` devolve `None` e o `Drop` do último resolve.
         if let Some(loaded) = Arc::get_mut(&mut self.loaded) {
             loaded.free_now();
         }
-    }
-
-    pub fn set_moe_runtime(&mut self, runtime: Arc<crate::moe::runtime::MoeRuntime>) -> Result<()> {
-        if self.moe_callback.is_some() {
-            bail!("hook MoE já está instalado neste contexto");
-        }
-        let state = Arc::new(MoeCallbackState {
-            runtime,
-            telemetry: Mutex::new(MoeCallbackTelemetry::default()),
-            error: Mutex::new(None),
-            route_diagnostic_emitted: AtomicBool::new(false),
-        });
-        unsafe {
-            sys::llama_set_moe_ffn_callback(
-                self.ctx,
-                Some(moe_ffn_callback),
-                Arc::as_ptr(&state) as *mut c_void,
-            );
-        }
-        if let Some(mtp) = self.mtp.as_ref() {
-            mtp.set_moe_callback(Some(moe_ffn_callback), Arc::as_ptr(&state) as *mut c_void);
-        }
-        self.moe_callback = Some(state);
-        Ok(())
-    }
-
-    pub fn moe_hook_enabled(&self) -> bool {
-        self.moe_callback.is_some()
-    }
-
-    pub fn moe_external_executor_enabled(&self) -> bool {
-        self.moe_external_executor
-    }
-
-    pub(super) fn begin_moe_callback(&self) {
-        if let Some(state) = self.moe_callback.as_ref() {
-            // O callback só é alcançado depois que o llama.cpp já construiu
-            // e começou a avaliar o grafo. Ceder o cache nesse ponto deixava
-            // o warmup competir com o prefill. O cancelamento é cooperativo,
-            // preserva os handles já residentes e impede que novos candidatos
-            // especulativos entrem enquanto a rota quente é montada.
-            state.runtime.cancel_device_warmup_for_forward();
-            state.begin();
-        }
-    }
-
-    pub(super) fn ensure_moe_executor_ready(&self) -> Result<()> {
-        if self.moe_external_executor && self.moe_callback.is_none() {
-            bail!(
-                "executor externo de MoE opt-in sem callback; recusa para evitar fallback nativo silencioso"
-            );
-        }
-        Ok(())
-    }
-
-    pub(super) fn finish_moe_callback(&self, timings: &mut DecodeTimings) -> Result<()> {
-        let Some(state) = self.moe_callback.as_ref() else {
-            return Ok(());
-        };
-        let telemetry = state.take()?;
-        if telemetry.forward_us == 0 {
-            bail!("hook MoE instalado, mas nenhum bloco MoE foi executado no llama.cpp; recusa para evitar fallback nativo silencioso");
-        }
-        timings.moe_forward_us = telemetry.forward_us;
-        timings.moe_executors = telemetry.executors;
-        timings.moe_executor = Some(state.runtime.executor_telemetry());
-        Ok(())
     }
 }
 
@@ -505,13 +418,11 @@ impl Drop for LlmEngine {
         // inicialização do servidor.
         self.mtp = None;
         self.vision = None;
-        self.moe_callback = None;
         // Só o contexto: os pesos são de `LoadedModel`, liberados quando o
         // último contexto que os usa sai de cena. Liberar o modelo aqui, com um
         // irmão ainda vivo, seria use-after-free.
         unsafe {
             if !self.ctx.is_null() {
-                sys::llama_set_moe_ffn_callback(self.ctx, None, ptr::null_mut());
                 sys::llama_free(self.ctx);
                 self.ctx = ptr::null_mut();
             }
@@ -533,7 +444,6 @@ impl LoadedModel {
         plan: &FitPlan,
         load_mtp: bool,
     ) -> Result<Arc<Self>> {
-        log_moe_route_diagnostics_configuration();
         // llama_backend_init is idempotent; call it on every load.
         init_backend()?;
 
@@ -546,13 +456,6 @@ impl LoadedModel {
             mparams.devices = plan.devices.as_ptr() as *mut sys::ggml_backend_dev_t;
         }
         mparams.load_mtp = load_mtp;
-        mparams.moe_external_executor = plan.config.moe_external_executor;
-        if !plan.config.moe_external_executor_layers.is_empty() {
-            mparams.moe_external_executor_layers =
-                plan.config.moe_external_executor_layers.as_ptr();
-            mparams.moe_external_executor_layer_count =
-                plan.config.moe_external_executor_layers.len();
-        }
         if !plan.tensor_split.is_empty() {
             mparams.tensor_split = plan.tensor_split.as_ptr();
         }
@@ -611,8 +514,6 @@ impl LoadedModel {
         // The companion has no external executor attached to it. Loading the
         // native expert weights is necessary because MtpDrafter only runs a
         // context and does not install the target engine's MoE callback.
-        cpu_cfg.moe_external_executor = false;
-        cpu_cfg.moe_external_executor_layers.clear();
         let plan = empty_fit_plan(&cpu_cfg);
         Self::load_with_mtp(model_path, &plan, true)
     }
@@ -628,8 +529,6 @@ impl LoadedModel {
     pub(super) fn load_mtp_draft(draft_path: &str, cfg: &EngineConfig) -> Result<Arc<Self>> {
         let mut draft_cfg = cfg.clone();
         draft_cfg.n_gpu_layers = DEFAULT_GPU_LAYERS;
-        draft_cfg.moe_external_executor = false;
-        draft_cfg.moe_external_executor_layers.clear();
         let plan = empty_fit_plan_with_mtp_mode(&draft_cfg, MtpFitMode::Vram);
         let loaded = Self::load_with_mtp(draft_path, &plan, true)?;
         if !loaded.has_nextn_weights() {
@@ -649,8 +548,6 @@ impl LoadedModel {
     pub(super) fn load_mtp_draft_cpu(draft_path: &str, cfg: &EngineConfig) -> Result<Arc<Self>> {
         let mut draft_cfg = cfg.clone();
         draft_cfg.n_gpu_layers = 0;
-        draft_cfg.moe_external_executor = false;
-        draft_cfg.moe_external_executor_layers.clear();
         let plan = empty_fit_plan_with_mtp_mode(&draft_cfg, MtpFitMode::Ram);
         let loaded = Self::load_with_mtp(draft_path, &plan, true)?;
         if !loaded.has_nextn_weights() {
@@ -701,8 +598,6 @@ mod mtp_draft_tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: Some(draft_path.to_string()),
         }

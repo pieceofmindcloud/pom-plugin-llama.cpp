@@ -142,11 +142,6 @@ pub struct EngineConfig {
     /// modelo comum. Ver `infer_server::should_draft` e
     /// `gateway::rollback_sessions`, que são o resto do mecanismo.
     pub rs_seq_window: u32,
-    /// Load routed MoE expert metadata without allocating expert weights in llama.cpp.
-    pub moe_external_executor: bool,
-    /// Per-layer ownership passed to the generic llama.cpp hook. Zero keeps
-    /// the native experts, one delegates the whole layer to the device cache.
-    pub moe_external_executor_layers: Vec<u8>,
 }
 
 pub fn apply_cache_types(
@@ -240,15 +235,6 @@ pub fn kv_seq_budget(max_sessions: u32) -> u32 {
 pub(super) const DEFAULT_GPU_LAYERS: i32 = 99;
 pub(super) const FIT_MEMORY_MIN_MARGIN_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const FIT_MIN_CONTEXT: u32 = 4096;
-/// The CUDA graph and kernel workspaces scale with the microbatch, while the
-/// public `n_batch` can stay large enough to accept a prompt chunk. A smaller
-/// ubatch is the safe automatic fallback before llama.cpp reserves those
-/// workspaces on a nearly-full GPU.
-pub(super) const FIT_MAX_UBATCH: u32 = crate::DEFAULT_N_UBATCH;
-/// Exceção aprovada para o contexto principal que usa o executor externo de
-/// MoE. O microlote menor devolve VRAM ao cache residente; não é a política
-/// do contexto denso nem do MTP, que continuam em `FIT_MAX_UBATCH`.
-pub(super) const MOE_EXTERNAL_MAX_UBATCH: u32 = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FitDeviceMemory {
@@ -774,8 +760,6 @@ mod fit_memory_margin_tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         }
@@ -1115,8 +1099,6 @@ mod fit_memory_margin_tests {
             moe_experts_in_ram: false,
             moe_cache_mib: 0,
             rs_seq_window: 0,
-            moe_external_executor: false,
-            moe_external_executor_layers: Vec::new(),
             mmproj_path: None,
             mtp_draft_path: None,
         }
@@ -1364,31 +1346,18 @@ pub(super) fn backend_registry_name(device: sys::ggml_backend_dev_t) -> Option<S
 }
 
 pub fn effective_n_ubatch(cfg: &EngineConfig) -> u32 {
-    effective_n_ubatch_with_limit(cfg, cfg.moe_external_executor)
-}
-
-/// Retorna o microlote físico do contexto MTP.
-///
-/// O MTP compartilha a configuração de sessão com o alvo MoE, mas o captain
-/// fixou 512 para o buffer de `nextn`. Por isso esta política não herda a
-/// exceção do contexto principal externo.
-pub fn effective_mtp_n_ubatch(cfg: &EngineConfig) -> u32 {
-    effective_n_ubatch_with_limit(cfg, false)
-}
-
-fn effective_n_ubatch_with_limit(cfg: &EngineConfig, external_moe: bool) -> u32 {
     let n_batch = cfg.n_batch.max(1);
     if cfg.fit_memory {
-        let chosen = cfg.n_ubatch.max(1);
-        let limit = if external_moe {
-            MOE_EXTERNAL_MAX_UBATCH.min(chosen)
-        } else {
-            chosen
-        };
-        n_batch.min(limit)
+        n_batch.min(cfg.n_ubatch.max(1))
     } else {
         n_batch
     }
+}
+
+/// Retorna o microlote físico do contexto MTP: a mesma política do contexto
+/// principal.
+pub fn effective_mtp_n_ubatch(cfg: &EngineConfig) -> u32 {
+    effective_n_ubatch(cfg)
 }
 
 /// Quantos threads de CPU o llama.cpp usa num contexto.
@@ -1698,11 +1667,6 @@ fn fit_plan_with_cache(
             params.devices = ordered_devices.as_ptr() as *mut sys::ggml_backend_dev_t;
         }
         params.load_mtp = load_mtp;
-        params.moe_external_executor = cfg.moe_external_executor;
-        if !cfg.moe_external_executor_layers.is_empty() {
-            params.moe_external_executor_layers = cfg.moe_external_executor_layers.as_ptr();
-            params.moe_external_executor_layer_count = cfg.moe_external_executor_layers.len();
-        }
         params
     };
     let make_context_params = |mtp: bool| {

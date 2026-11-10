@@ -41,11 +41,7 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
   Os snapshots nativos usados por `/health` passam pelo
   `wrapper_common.cpp`; eles devem tratar qualquer nome/descrição C nulo antes
   de chegar a `std::string` ou JSON, pois essa falha pode virar
-  `strlen(nullptr)` no runtime C do Windows. Antes de cada avaliação do grafo
-  com callback MoE, `begin_moe_callback` sinaliza o cancelamento do warmup sem
-  aguardar a thread: o caminho quente não fica atrás de uma admissão CUDA
-  corrente. O `join` permanece somente na troca explícita de warmup, fora da
-  inferência. `DecodeTimings::backend_call_us` mede a chamada de avaliação do
+  `strlen(nullptr)` no runtime C do Windows. `DecodeTimings::backend_call_us` mede a chamada de avaliação do
   llama.cpp; `backend_sync_us` mede separadamente a sincronização explícita. A
   primeira não é tempo puro de kernel, e a segunda pode esperar trabalho de
   dispositivo e transferências já enfileirados. `llm/sampling.rs` representa a
@@ -59,9 +55,6 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
   `LLAMA_SOURCE` e, por padrão, o caminho vendorizado
   `vendor/llama-cpp-sys-2/llama.cpp`, que é materializado como diretório real
   no Windows.
-  Quando o modelo alvo usa MoE externo metadata-only, `LlmEngine::set_moe_runtime`
-  instala o mesmo callback também no contexto MTP; o acompanhante CPU do recuo
-  mantém o caminho nativo porque seus pesos de experts estão presentes.
   `EngineConfig.mtp_draft_path` (+ `LoadedModel::load_mtp_draft`) é uma segunda
   fonte de pesos `nextn`: um GGUF de rascunho separado ("shared MTP module",
   ex. `qwen4exp`/Qwen3.8-Flash-Next) carregado como `LoadedModel` independente e
@@ -116,86 +109,6 @@ para `120a`). As pontes C/C++ compiladas por `cc` tambem herdam o
   (`mtp_context_to_ram_turns_off_the_cache_offload` em `mtp.rs`), e a
   camada 1 no espelhamento exato de `load_mtp_cpu` (mesmo padrão, já usado
   em produção para o `nextn` embutido).
-- `moe/` file access: every expert reader opens the model through
-  `format_q4_0::map_tensor_source`. For a header-only virtual slice (the
-  `general.external_data.*` keys the POM writes and the llama.cpp fork's
-  `pom` branch loads), it maps the one source file the tensors
-  point into and returns `data_start = 0` with absolute offsets, so the
-  readers keep indexing `data_start + offset`. A source in more than one file
-  is refused for the executor. Test:
-  `format_q4_0::tests::a_header_with_external_data_reads_the_experts_from_the_source_file`.
-- `moe/` - executor MoE próprio (denso + esparso), com kernels CUDA em
-  `moe/cuda_kernels.cu` compilados por `build.rs` sob `--features cuda`
-  (no alvo MSVC: `-Xcompiler /MD` e `pom_moe_cuda.lib` via `lib.exe`; nos
-  demais, `libpom_moe_cuda.a` via `ar`). O
-  fallback CPU do router executa os experts selecionados em workers escopados
-  e agrega os vetores na ordem original para manter o resultado determinístico;
-  Q4_0 e Q5_K também usam a ponte CUDA heterogênea quando `cuda` está
-  disponível, e um fallback CPU efetivo fica registrado na telemetria e no log
-  de inicialização. O cache CUDA residente é particionado por ordinal (`CUDA0`,
-  `CUDA1`, ...), com orçamento e allocator próprios por placa; as rotas são
-  agrupadas por shard e executadas em paralelo. O caminho heterogêneo consulta
-  primeiro as especificações do mmap e só copia bytes em um miss; seu workspace
-  CUDA é um pipeline persistente compartilhado pelas camadas, indexado por
-  device e geometria. O agregado do cache publica os nomes dos devices e os
-  bytes residentes por shard para a telemetria. A ponte CUDA é código próprio
-  deste crate; o fork `vendor/llama-cpp-sys-2/llama.cpp` só fornece o callback e
-  os metadados de memória. O caminho uniforme IQ3_XXS (dtype 18) também usa o
-  pipeline persistente e kernels cooperativos; IQ e K compartilham buffers e
-  o mesmo agrupamento por CUDA<n>, sem `cudaDeviceSynchronize` no hot path.
-  Os diagnósticos CUDA são automáticos sempre que um executor MoE CUDA existe;
-  `POM_MOE_CUDA_PROFILE` não é necessário nem altera a execução. Quando há
-  `<modelo>.cuda-profile.json` com um `BandwidthProfile`, o bloco heterogêneo
-  também divide misses entre lanes CPU e GPU e as executa em paralelo, como o
-  NVFP4. Sem sidecar, mantém a política exclusivamente CUDA; coexecução só
-  usa taxas persistidas e medidas para não inventar uma velocidade de CPU.
-  Antes do forward heterogêneo, as specs de toda a rota são construídas em
-  uma travessia do inventário da camada e os misses são carregados em uma
-  thread por shard;
-  cada shard serializa sua admissão pelo mutex, enquanto CUDA0/CUDA1 podem
-  fazer H2D em paralelo. O upload usa diretamente a fatia do mmap, sem copiar
-  cada tensor para um `Vec` intermediário. Os leases de admissão permanecem
-  ativos até o forward terminar. Quando há vários misses no mesmo shard, o
-  allocator faz todas as alocações e cópias em um lote e sincroniza o stream
-  uma vez; eviction usa `cudaFreeAsync` para não introduzir um wait global por
-  tensor. A cópia ainda termina antes de o slice temporário sair de escopo.
-  O warmup percorre experts por camada em ordem expert-major, espalhando as
-  admissões pelas camadas antes de esgotar o orçamento de cada GPU; isso evita
-  aquecer apenas o prefixo do modelo e concentrar misses na primeira
-  requisição.
-  A telemetria também publica, por camada, o working set observado de experts
-  distintos por token e, por shard, os valores brutos de VRAM que formaram o
-  orçamento (`baseline_free`, `current_free`, compute, reserva, limites e
-  entradas residentes). Isso separa pressão real do orçamento de uma eviction
-  indevida de lease ativo e permite auditar uma margem conservadora.
-  Por decisão aprovada do operador, o contexto principal com
-  `moe_external_executor` usa `n_ubatch=128` para devolver VRAM ao cache
-  residente. Essa exceção também reduz o microlote de atenção e KV desse
-  contexto, trade-off aceito para o caminho MoE. O caminho denso do llama.cpp
-  e o contexto MTP permanecem no valor padrão de `FIT_MAX_UBATCH=512`; o MTP
-  usa uma política de parâmetros própria para não herdar a exceção.
-  Pares repetidos de expert e token são calculados uma vez e a agregação
-  conserva o peso de cada rota original.
-  No IQ3_XXS a entrada é quantizada para `block_q8_1` e o decoder nativo
-  `vec_dot_iq3_xxs_q8_1` do fork usa `dp4a`. As 32 lanes cobrem quatro
-  superblocos por warp, cada uma processando uma fatia q8 e avançando em
-  passos de quatro, sem uma árvore de shared memory por linha. Gate e up são
-  calculados na mesma warp e os buffers q8 de hidden e ativação ficam
-  residentes na pipeline persistente.
-  O caminho heterogêneo também usa os `vec_dot_*_q8_1` canônicos para Q4/K/IQ,
-  quantiza hidden e ativação em buffers persistentes e executa uma warp por
-  linha; isso é importante para GGUF como Mistral-Small, que combina dtypes
-  18, 22 e 23 nos papéis gate/up/down.
-  O dispatcher q8 heterogêneo escolhe helpers diretos por dtype, sem ponteiro
-  de função de device no loop de blocos, permitindo ao nvcc fazer inline das
-  primitivas canônicas.
-  Cada pipeline heterogêneo mantém um staging host pinned para a saída CUDA:
-  o callback do llama.cpp continua recebendo um buffer host comum, mas a
-  transferência D2H não paga o staging pageable em cada chamada.
-  Com o perfil CUDA, `cuda_device_calls` separa chamadas, experts e tempos por
-  ordinal para distinguir bytes residentes de uso efetivo da placa.
-  A cobertura CUDA por dtype e os números do servidor CUDA de teste ficam em
-  `docs/subsystems/freetoken-moe.md`.
 - `collective.rs` - `reduce_sum` + `ReduceBarrier` do tensor parallelism
   (caminho C). O transporte HTTP e a coordenação com o primary ficam em
   `crates/node/src/inference/tp.rs`, que **não** migrou.
@@ -266,8 +179,7 @@ testes, `llama_engine::llama_cpp_sys_2`), e todo o resto do pipeline
 (`infer_server.rs`, `prefill.rs`, `direct.rs`, `runtime.rs`, ...).
 
 O ciclo de vida nativo deve ser encerrado na ordem inversa da criação:
-contextos MTP e Vision liberam callbacks antes de llama_free, e o callback
-MoE do engine principal é limpo antes de qualquer userdata compartilhado cair.
+contextos MTP e Vision liberam callbacks antes de llama_free.
 Essa regra fica implementada nos Drop de LlmEngine e MtpDrafter; alterá-la
 exige revisar a fronteira FFI e testar a destruição de gerações compatíveis.
 
@@ -307,10 +219,7 @@ assíncrona com segurança sem mudar a fronteira nativa.
 
 ## Defeitos anotados
 
-- DEFEITO ANOTADO: com `--features cuda`, `cargo test -p llama-engine` não
-  compila. Quatro testes em `src/moe/cuda.rs` (por volta das linhas 2985, 3593,
-  3921 e 4020) chamam `run_route_batch_resident` com 8 argumentos, e a função
-  hoje recebe 9 (`device_indices` foi acrescentado). Sem CUDA a suíte compila.
+Nenhum no momento.
 
 ## Maintaining this file
 
