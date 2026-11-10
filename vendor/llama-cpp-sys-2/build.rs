@@ -1473,9 +1473,13 @@ fn main() {
         for entry in glob(mtmd_src.join("**/*.cpp").to_str().unwrap()).unwrap() {
             match entry {
                 Ok(path) => {
-                    // Skip CLI / deprecation-warning binaries — we only want the library sources
+                    // Skip the CLI / debug / deprecation-warning binaries (each has a
+                    // `main`) — we only want the library sources
                     let filename = path.file_name().unwrap().to_str().unwrap();
-                    if filename == "mtmd-cli.cpp" || filename == "deprecation-warning.cpp" {
+                    if matches!(
+                        filename,
+                        "mtmd-cli.cpp" | "mtmd-debug.cpp" | "deprecation-warning.cpp"
+                    ) {
                         continue;
                     }
                     mtmd_build.file(build_tool_path(&path, target_is_windows));
