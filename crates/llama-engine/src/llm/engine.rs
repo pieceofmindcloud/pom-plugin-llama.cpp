@@ -2411,6 +2411,45 @@ impl LlmEngine {
         }
     }
 
+    // ── Output embeddings (GPU work metering) ────────────────────────────────
+
+    /// Whether this context can hand out its final hidden state (after the
+    /// output norm) through llama.cpp's own embeddings output, without the
+    /// residual capture callback: one row per output token, so the pooling
+    /// must be per token and the output width the hidden width.
+    pub fn output_embeddings_supported(&self) -> bool {
+        let pooling = unsafe { sys::llama_pooling_type(self.ctx) };
+        pooling == sys::LLAMA_POOLING_TYPE_NONE && self.n_embd == self.n_embd_out
+    }
+
+    /// Turns llama.cpp's embeddings output on or off for the next decodes
+    /// (`llama_set_embeddings`). The logits keep coming as before; with it on,
+    /// each output token also copies its post-norm row to the host. Used by
+    /// the last stage of a pipeline to prove its work while metering is on.
+    /// Refused when the context cannot give per-token rows.
+    pub fn set_output_embeddings(&mut self, on: bool) -> Result<()> {
+        if on && !self.output_embeddings_supported() {
+            bail!("this context cannot output per-token embeddings (pooling or output width)");
+        }
+        unsafe { sys::llama_set_embeddings(self.ctx, on) };
+        Ok(())
+    }
+
+    /// The post-norm rows of the output tokens `indices` of the last decode
+    /// (`llama_get_embeddings_ith`), concatenated, `n_embd` floats each.
+    /// Needs `set_output_embeddings(true)` before that decode.
+    pub fn output_embeddings(&self, indices: &[i32]) -> Result<Vec<f32>> {
+        let mut out = Vec::with_capacity(indices.len() * self.n_embd);
+        for &i in indices {
+            let ptr = unsafe { sys::llama_get_embeddings_ith(self.ctx, i) };
+            if ptr.is_null() {
+                bail!("llama_get_embeddings_ith returned NULL for output {i}");
+            }
+            unsafe { out.extend_from_slice(std::slice::from_raw_parts(ptr, self.n_embd)) };
+        }
+        Ok(out)
+    }
+
     // ── Logits ───────────────────────────────────────────────────────────────
 
     pub fn logits_ith(&self, i: i32) -> &[f32] {
