@@ -230,9 +230,16 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
         });
     }
 
-    let data_start = align_up(reader.pos)?;
+    let mut data_start = align_up(reader.pos)?;
     if data_start > data.len() {
-        bail!("GGUF truncado antes da seção de dados");
+        // A part with no tensors (Unsloth's first part holds only the
+        // metadata) may end before the alignment padding: it has no data
+        // section to truncate, so its data starts where the file ends.
+        if tensor_count == 0 && reader.pos <= data.len() {
+            data_start = data.len();
+        } else {
+            bail!("GGUF truncado antes da seção de dados");
+        }
     }
     Ok(ParsedHeader {
         tensor_count,
@@ -690,6 +697,47 @@ mod tests {
             out.push(0);
         }
         out
+    }
+
+    /// The header without its alignment padding: how Unsloth's metadata-only
+    /// first part ends (a few bytes before the aligned data start).
+    fn unpadded_header(no: u16, total_tensor_count: u64) -> Vec<u8> {
+        let mut out = header(no, total_tensor_count, &[]);
+        // the last field written is split.tensors.count (u64); everything after it is padding
+        let end = 4 + 4 + 8 + 8
+            + [("split.count"), ("split.no")]
+                .iter()
+                .map(|key| 8 + key.len() + 4 + 2)
+                .sum::<usize>()
+            + 8 + "split.tensors.count".len() + 4 + 8;
+        assert!(end % ALIGN != 0, "the test needs a header that is not already aligned");
+        out.truncate(end);
+        out
+    }
+
+    #[test]
+    fn a_metadata_only_first_part_may_end_before_the_alignment_padding() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("pom-multipart-unpadded-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("model-00001-of-00002.gguf");
+        let second = dir.join("model-00002-of-00002.gguf");
+        std::fs::write(&first, unpadded_header(0, 1)).unwrap();
+        let mut second_bytes = header(1, 1, &[("blk.0.weight", 0)]);
+        second_bytes.extend_from_slice(&[7u8; 16]);
+        std::fs::write(&second, &second_bytes).unwrap();
+
+        let info = crate::gguf::read_info(&first).unwrap();
+        let metadata = catalog_metadata(&first, &info).unwrap();
+        assert_eq!(metadata.parts.len(), 2);
+        let source = GgufSource::open(&first).unwrap();
+        assert_eq!(source.tensors().len(), 1);
+        assert_eq!(source.tensors()[0].byte_size, 16);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
