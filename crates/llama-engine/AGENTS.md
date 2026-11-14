@@ -217,6 +217,15 @@ medida de largura de banda D2H. A stream CUDA e a vida útil do tensor não são
 expostas por essa API, então a captura não pode mover a cópia para uma operação
 assíncrona com segurança sem mudar a fronteira nativa.
 
+Saída de embeddings (medição de trabalho de GPU do POM): `set_output_embeddings`
+liga ou desliga `llama_set_embeddings` num contexto já criado, sem o callback
+de captura, e `output_embeddings(indices)` lê as linhas pós-`output_norm`
+(`llama_get_embeddings_ith`) dos tokens de saída do último decode. O último
+estágio de um pipeline usa isso para provar seu trabalho enquanto a medição
+está ligada, e o verificador para reproduzir as mesmas linhas. Só vale com
+pooling por token e `n_embd == n_embd_out` (`output_embeddings_supported`);
+os logits continuam saindo como antes.
+
 ## Defeitos anotados
 
 Nenhum no momento.
