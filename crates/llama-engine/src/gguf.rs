@@ -314,7 +314,7 @@ impl GgufInfo {
     ) -> Result<u32> {
         let values = values
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("GGUF não declara {name}; orçamento KV recusado"))?;
+            .ok_or_else(|| anyhow::anyhow!("GGUF does not declare {name}; KV budget refused"))?;
         let index = if values.len() == 1 {
             0
         } else if values.len() == range_layers as usize {
@@ -329,7 +329,7 @@ impl GgufInfo {
             )
         })?;
         if value == 0 {
-            bail!("GGUF declara {name}=0 na camada {layer}; orçamento KV recusado");
+            bail!("GGUF declares {name}=0 at layer {layer}; KV budget refused");
         }
         Ok(value)
     }
@@ -560,7 +560,7 @@ impl<R: Read + Seek> Reader<R> {
 }
 
 fn nonnegative_integer(value: i128) -> Result<u64> {
-    u64::try_from(value).map_err(|_| anyhow::anyhow!("inteiro GGUF não pode ser negativo: {value}"))
+    u64::try_from(value).map_err(|_| anyhow::anyhow!("a GGUF integer cannot be negative: {value}"))
 }
 
 /// Parse the KV header of a GGUF file.
@@ -1029,11 +1029,11 @@ impl GgufLayout {
         let total_layers = self.layer_count();
         for &(start, end) in ranges {
             if start > end || end >= total_layers {
-                bail!("intervalo de camadas inválido L{start}-{end}");
+                bail!("invalid layer range L{start}-{end}");
             }
             if self.restricted_slice_starts.is_some() && !self.is_valid_slice_start(start) {
                 bail!(
-                    "{} não pode começar um slice em L{start}: cortes válidos em {:?}",
+                    "{} cannot start a slice at L{start}: valid cuts at {:?}",
                     serialized.architecture,
                     self.arch_boundaries()
                 );
@@ -1122,7 +1122,7 @@ pub fn validate_slice_tensors(
             .collect();
         if !missing.is_empty() {
             bail!(
-                "fatiamento da arquitetura '{architecture}' recusado para faixa não final: não foi possível copiar da origem os tensores obrigatórios {}",
+                "slicing of architecture '{architecture}' refused for a non-final range: the required tensors {} could not be copied from the source",
                 missing.join(", ")
             );
         }
@@ -1136,7 +1136,7 @@ pub fn validate_slice_tensors(
         .collect();
     if !missing.is_empty() {
         bail!(
-            "fatiamento da arquitetura '{architecture}' recusado: a fatia final exige os tensores não-bloco {}, mas a origem não os contém",
+            "slicing of architecture '{architecture}' refused: the final slice needs the non-block tensors {}, but the source does not contain them",
             missing.join(", ")
         );
     }
@@ -1353,7 +1353,7 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
     let first_map = source
         .parts()
         .first()
-        .ok_or_else(|| anyhow::anyhow!("GGUF sem partes"))?
+        .ok_or_else(|| anyhow::anyhow!("GGUF without parts"))?
         .map();
     let mut r = Reader {
         inner: Cursor::new(first_map),
@@ -1407,7 +1407,7 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
                         .map(|_| {
                             r.value_as_u32(element_type)?.ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "metadata '{}' tem elementos que não são inteiros não negativos",
+                                    "metadata '{}' has elements that are not non-negative integers",
                                     key
                                 )
                             })
@@ -1435,7 +1435,7 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
         ) {
             let Some(count) = scalar_u32 else {
                 bail!(
-                    "metadata '{key}' conta camadas desde o início, mas não é um inteiro escalar não negativo que caiba em u32"
+                    "metadata '{key}' counts layers from the start, but is not a non-negative scalar integer that fits in u32"
                 );
             };
             layout.start_relative_layer_counts.push(count);
@@ -1462,7 +1462,7 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
         .map(|tensor| {
             if ggml_type_info(tensor.dtype).is_none() {
                 return Err(anyhow::anyhow!(
-                    "dtype GGML {} desconhecido no tensor '{}'; estimativa de tamanho recusada",
+                    "unknown GGML dtype {} in tensor '{}'; size estimate refused",
                     tensor.dtype,
                     tensor.name
                 ));
@@ -1539,7 +1539,7 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
                 .any(|tensor| tensor.name == "per_layer_token_embd.weight")
         {
             bail!(
-                "a origem {architecture} declara PLE, mas não contém per_layer_token_embd.weight"
+                "the {architecture} source declares PLE but does not contain per_layer_token_embd.weight"
             );
         }
     }
@@ -1569,7 +1569,7 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
         }
         if array.count != 1 && array.count < original_block_count as u64 {
             bail!(
-                "array metadata '{}' tem comprimento {}; esperado 1 ou pelo menos {} (contagem original de blocos)",
+                "array metadata '{}' has length {}; expected 1 or at least {} (the original block count)",
                 entry.key,
                 array.count,
                 original_block_count
@@ -1577,7 +1577,7 @@ pub fn read_layout(path: &Path) -> Result<GgufLayout> {
         }
         if array.count >= original_block_count as u64 && scalar_size(array.element_type).is_none() {
             bail!(
-                "array metadata '{}' tem elementos aninhados e não pode ser fatiado por camada",
+                "array metadata '{}' has nested elements and cannot be sliced by layer",
                 entry.key
             );
         }
