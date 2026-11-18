@@ -109,6 +109,11 @@ pub struct EngineConfig {
     /// fit off the micro-batch is the batch, as before.
     pub n_ubatch: u32,
     pub n_gpu_layers: i32,
+    /// The GPUs this model may use, each as its vendor numbers it among that
+    /// vendor's cards (`(Nvidia, 1)` is the second NVIDIA card). `None` = every
+    /// device the process sees. A deployment on one GPU of a two-GPU machine
+    /// loads only there; `Some(vec![])` keeps the model on the CPU.
+    pub devices: Option<Vec<(crate::sysmon::GpuVendor, u32)>>,
     pub n_threads: i32,
     pub max_sessions: u32,
     /// True for non-last peers that need to hand the residual to the next peer.
@@ -752,6 +757,7 @@ mod fit_memory_margin_tests {
             n_batch: 128,
             n_ubatch: crate::DEFAULT_N_UBATCH,
             n_gpu_layers: DEFAULT_GPU_LAYERS,
+            devices: None,
             n_threads: 0,
             need_embeddings: false,
             mtp: true,
@@ -1091,6 +1097,7 @@ mod fit_memory_margin_tests {
             n_batch: 128,
             n_ubatch: crate::DEFAULT_N_UBATCH,
             n_gpu_layers: DEFAULT_GPU_LAYERS,
+            devices: None,
             n_threads: 0,
             need_embeddings: false,
             mtp: true,
@@ -1345,6 +1352,99 @@ pub(super) fn backend_registry_name(device: sys::ggml_backend_dev_t) -> Option<S
     unsafe { CStr::from_ptr(name).to_str().ok().map(str::to_owned) }
 }
 
+fn backend_device_description(device: sys::ggml_backend_dev_t) -> String {
+    if device.is_null() {
+        return String::new();
+    }
+    let raw = unsafe { sys::ggml_backend_dev_description(device) };
+    if raw.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(raw).to_string_lossy().into_owned() }
+}
+
+/// Which of the devices (each its backend registry name and description, in
+/// the registry's order) are the picked GPUs. A CUDA device is an NVIDIA card,
+/// a ROCm/HIP one an AMD card, and a Vulkan one is classified by its
+/// description; a Vulkan NVIDIA device is skipped when CUDA already serves the
+/// NVIDIA cards, so each card is counted once. The ordinal is the position
+/// among the same vendor's cards, the number the node gives them.
+pub(super) fn picked_device_indices(
+    devices: &[(String, String)],
+    picks: &[(crate::sysmon::GpuVendor, u32)],
+) -> Vec<usize> {
+    use crate::sysmon::GpuVendor;
+    let has_cuda = devices.iter().any(|(backend, _)| backend == "CUDA");
+    let (mut nvidia, mut amd) = (0u32, 0u32);
+    let mut chosen = Vec::new();
+    for (index, (backend, description)) in devices.iter().enumerate() {
+        let vendor = match backend.as_str() {
+            "CUDA" => GpuVendor::Nvidia,
+            "ROCm" | "HIP" => GpuVendor::Amd,
+            "Vulkan" if description.to_ascii_uppercase().contains("NVIDIA") => {
+                if has_cuda {
+                    continue;
+                }
+                GpuVendor::Nvidia
+            }
+            "Vulkan" => GpuVendor::Amd,
+            _ => continue,
+        };
+        let ordinal = match vendor {
+            GpuVendor::Nvidia => {
+                nvidia += 1;
+                nvidia - 1
+            }
+            GpuVendor::Amd => {
+                amd += 1;
+                amd - 1
+            }
+            GpuVendor::Apple => continue,
+        };
+        if picks.contains(&(vendor, ordinal)) {
+            chosen.push(index);
+        }
+    }
+    chosen
+}
+
+/// The devices of `available` that `cfg.devices` picks, or all of them when the
+/// config picks none.
+pub(super) fn restrict_devices(
+    cfg: &EngineConfig,
+    available: Vec<sys::ggml_backend_dev_t>,
+) -> Vec<sys::ggml_backend_dev_t> {
+    let Some(picks) = &cfg.devices else {
+        return available;
+    };
+    let described = available
+        .iter()
+        .map(|&device| {
+            (
+                backend_registry_name(device).unwrap_or_default(),
+                backend_device_description(device),
+            )
+        })
+        .collect::<Vec<_>>();
+    picked_device_indices(&described, picks)
+        .into_iter()
+        .map(|index| available[index])
+        .collect()
+}
+
+/// The NULL-terminated device list llama.cpp takes for a model restricted by
+/// `cfg.devices`; `None` when the config restricts nothing.
+pub(super) fn restricted_device_list(cfg: &EngineConfig) -> Option<Vec<sys::ggml_backend_dev_t>> {
+    cfg.devices.as_ref()?;
+    let n_devices = unsafe { sys::llama_max_devices() }.max(1);
+    let mut available = vec![ptr::null_mut(); n_devices.max(32)];
+    let count = unsafe { sys::llama_rs_get_devices(available.as_mut_ptr(), available.len()) };
+    available.truncate(count.min(available.len()));
+    let mut list = restrict_devices(cfg, available);
+    list.push(ptr::null_mut());
+    Some(list)
+}
+
 pub fn effective_n_ubatch(cfg: &EngineConfig) -> u32 {
     let n_batch = cfg.n_batch.max(1);
     if cfg.fit_memory {
@@ -1527,6 +1627,19 @@ fn fit_plan_with_cache(
         sys::llama_rs_get_devices(available_devices.as_mut_ptr(), available_devices.len())
     };
     available_devices.truncate(available_count.min(n_devices));
+    let restricted = cfg.devices.is_some();
+    if restricted {
+        available_devices = restrict_devices(cfg, available_devices);
+        if available_devices.is_empty() {
+            // None of the deployment's GPUs is here: the model runs on the CPU
+            // (the load hands llama.cpp an empty device list).
+            return Ok(empty_fit_plan_with_mtp_mode_and_reason(
+                cfg,
+                mtp_mode_without_gpu_fit(mtp_mode, cfg.mtp_placement),
+                mtp_unavailable_reason,
+            ));
+        }
+    }
     let mut device_memories = vec![
         sys::llama_rs_device_memory {
             free_bytes: 0,
@@ -1534,7 +1647,7 @@ fn fit_plan_with_cache(
         };
         n_devices
     ];
-    let memory_count = if available_devices.is_empty() {
+    let memory_count = if available_devices.is_empty() && !restricted {
         // Keep the old wrapper path for an empty device registry so a missing
         // snapshot continues to take the existing safe fit fallback.
         let count = unsafe {
@@ -1611,6 +1724,15 @@ fn fit_plan_with_cache(
         devices
     })
     .unwrap_or_default();
+    // A deployment restricted to some GPUs hands llama.cpp that list even when
+    // the memory order changed nothing: without it the model uses every device.
+    let ordered_devices = if restricted && ordered_devices.is_empty() {
+        let mut devices = available_devices.clone();
+        devices.push(ptr::null_mut());
+        devices
+    } else {
+        ordered_devices
+    };
     if available_devices.len() > 1 {
         tracing::info!(
             device_backend_names = ?backend_names,
@@ -1873,4 +1995,39 @@ fn fit_plan_with_cache(
         mtp_unavailable_reason,
         applied: true,
     })
+}
+
+#[cfg(test)]
+mod device_pick_tests {
+    use super::picked_device_indices;
+    use crate::sysmon::GpuVendor;
+
+    fn devices(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter().map(|(b, d)| (b.to_string(), d.to_string())).collect()
+    }
+
+    /// Two NVIDIA cards: the second one alone is CUDA1, whatever else is there.
+    #[test]
+    fn the_second_nvidia_card_is_picked_by_its_ordinal() {
+        let found = devices(&[("CUDA", "RTX 5060 Ti"), ("CUDA", "RTX 5060 Ti")]);
+        assert_eq!(picked_device_indices(&found, &[(GpuVendor::Nvidia, 1)]), vec![1]);
+        assert_eq!(
+            picked_device_indices(&found, &[(GpuVendor::Nvidia, 0), (GpuVendor::Nvidia, 1)]),
+            vec![0, 1]
+        );
+    }
+
+    /// CUDA and Vulkan on one machine: Vulkan also lists the NVIDIA card, which
+    /// CUDA already serves, so the Radeon is the first AMD card.
+    #[test]
+    fn a_vulkan_nvidia_device_is_not_counted_twice() {
+        let found = devices(&[
+            ("CUDA", "NVIDIA GeForce RTX 5060 Ti"),
+            ("Vulkan", "NVIDIA GeForce RTX 5060 Ti"),
+            ("Vulkan", "AMD Radeon RX 7800 XT"),
+        ]);
+        assert_eq!(picked_device_indices(&found, &[(GpuVendor::Amd, 0)]), vec![2]);
+        assert_eq!(picked_device_indices(&found, &[(GpuVendor::Nvidia, 0)]), vec![0]);
+        assert!(picked_device_indices(&found, &[]).is_empty());
+    }
 }

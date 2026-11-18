@@ -334,6 +334,7 @@ mod pool_tests {
             n_batch: 512,
             n_ubatch: crate::DEFAULT_N_UBATCH,
             n_gpu_layers: 99,
+            devices: None,
             n_threads: 0,
             max_sessions: 2,
             need_embeddings: true,

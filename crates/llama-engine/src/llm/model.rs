@@ -78,7 +78,7 @@ impl VisionContext {
         if params.use_gpu {
             let weights = std::fs::metadata(mmproj_path).map(|meta| meta.len()).unwrap_or(0);
             let need = vision_reserve_bytes(weights);
-            let devices = gpu_devices_with_free_memory();
+            let devices = gpu_devices_with_free_memory(cfg);
             match choose_vision_device(&devices, need) {
                 Some(index) => {
                     let (device, free, name) = &devices[index];
@@ -142,10 +142,12 @@ fn choose_vision_device<D>(devices: &[(D, u64, String)], need: u64) -> Option<us
 }
 
 /// Every GPU-like device the backend registry offers, with its free memory now.
-fn gpu_devices_with_free_memory() -> Vec<(sys::ggml_backend_dev_t, u64, String)> {
+fn gpu_devices_with_free_memory(cfg: &EngineConfig) -> Vec<(sys::ggml_backend_dev_t, u64, String)> {
     let mut devices = vec![ptr::null_mut(); 32];
     let count = unsafe { sys::llama_rs_get_devices(devices.as_mut_ptr(), devices.len()) };
     devices.truncate(count.min(32));
+    // The projector stays on the deployment's GPUs too.
+    let devices = super::config::restrict_devices(cfg, devices);
     devices
         .into_iter()
         .filter(|device| !device.is_null())
@@ -452,8 +454,17 @@ impl LoadedModel {
 
         let mut mparams = unsafe { sys::llama_model_default_params() };
         mparams.n_gpu_layers = plan.config.n_gpu_layers;
+        // Without a fit plan (fit off, or no GPU memory to fit) the
+        // deployment's GPU choice still holds: only those devices.
+        let restricted = if plan.devices.is_empty() {
+            super::config::restricted_device_list(&plan.config)
+        } else {
+            None
+        };
         if !plan.devices.is_empty() {
             mparams.devices = plan.devices.as_ptr() as *mut sys::ggml_backend_dev_t;
+        } else if let Some(list) = &restricted {
+            mparams.devices = list.as_ptr() as *mut sys::ggml_backend_dev_t;
         }
         mparams.load_mtp = load_mtp;
         if !plan.tensor_split.is_empty() {
@@ -589,6 +600,7 @@ mod mtp_draft_tests {
             n_batch: 64,
             n_ubatch: crate::DEFAULT_N_UBATCH,
             n_gpu_layers: 0,
+            devices: None,
             n_threads: 1,
             max_sessions: 1,
             need_embeddings: false,

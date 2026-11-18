@@ -191,7 +191,7 @@ pub struct GpuProcess {
 /// Separado de `GpuKind` de propósito: `GpuKind` descreve a **máquina** (e por
 /// isso tem `None` e `Mixed`), enquanto isto descreve **uma placa**, onde essas
 /// duas variantes não fariam sentido.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum GpuVendor {
     Nvidia,
